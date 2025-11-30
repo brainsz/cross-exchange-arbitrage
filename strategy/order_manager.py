@@ -1,11 +1,11 @@
-"""Order placement and monitoring for EdgeX and Lighter exchanges."""
+"""Order placement and monitoring for Maker Exchange and Lighter."""
 import asyncio
 import logging
 import time
 from decimal import Decimal
 from typing import Optional
 
-from edgex_sdk import Client, OrderSide, CancelOrderParams, GetOrderBookDepthParams
+from exchanges.base import BaseExchangeClient, OrderResult
 from lighter.signer_client import SignerClient
 
 
@@ -17,12 +17,12 @@ class OrderManager:
         self.order_book_manager = order_book_manager
         self.logger = logger
 
-        # EdgeX client and config
-        self.edgex_client: Optional[Client] = None
-        self.edgex_contract_id: Optional[str] = None
-        self.edgex_tick_size: Optional[Decimal] = None
-        self.edgex_order_status: Optional[str] = None
-        self.edgex_client_order_id: str = ''
+        # Maker client and config
+        self.maker_client: Optional[BaseExchangeClient] = None
+        self.maker_contract_id: Optional[str] = None
+        self.maker_tick_size: Optional[Decimal] = None
+        self.maker_order_status: Optional[str] = None
+        self.maker_client_order_id: str = ''
 
         # Lighter client and config
         self.lighter_client: Optional[SignerClient] = None
@@ -47,11 +47,11 @@ class OrderManager:
         # Callbacks
         self.on_order_filled: Optional[callable] = None
 
-    def set_edgex_config(self, client: Client, contract_id: str, tick_size: Decimal):
-        """Set EdgeX client and configuration."""
-        self.edgex_client = client
-        self.edgex_contract_id = contract_id
-        self.edgex_tick_size = tick_size
+    def set_maker_config(self, client: BaseExchangeClient, contract_id: str, tick_size: Decimal):
+        """Set Maker client and configuration."""
+        self.maker_client = client
+        self.maker_contract_id = contract_id
+        self.maker_tick_size = tick_size
 
     def set_lighter_config(self, client: SignerClient, market_index: int,
                            base_amount_multiplier: int, price_multiplier: int, tick_size: Decimal):
@@ -68,118 +68,153 @@ class OrderManager:
 
     def round_to_tick(self, price: Decimal) -> Decimal:
         """Round price to tick size."""
-        if self.edgex_tick_size is None:
+        if self.maker_tick_size is None:
             return price
-        return (price / self.edgex_tick_size).quantize(Decimal('1')) * self.edgex_tick_size
+        return (price / self.maker_tick_size).quantize(Decimal('1')) * self.maker_tick_size
 
-    async def fetch_edgex_bbo_prices(self) -> tuple[Decimal, Decimal]:
-        """Fetch best bid/ask prices from EdgeX using websocket data."""
-        # Use WebSocket data if available
-        edgex_bid, edgex_ask = self.order_book_manager.get_edgex_bbo()
-        if (self.order_book_manager.edgex_order_book_ready and
-                edgex_bid and edgex_ask and edgex_bid > 0 and edgex_ask > 0 and edgex_bid < edgex_ask):
-            return edgex_bid, edgex_ask
+    async def fetch_maker_bbo_prices(self) -> tuple[Decimal, Decimal]:
+        """Fetch best bid/ask prices from Maker exchange."""
+        # Use WebSocket data if available (EdgeX specific check, can be generalized later)
+        # For now, we rely on the client's fetch_bbo_prices which handles REST/WS abstraction
+        
+        # If order_book_manager has data, use it (assuming it's populated via WS)
+        # Note: GenericArb currently sets up WS for EdgeX but not explicitly for others in a generic way yet
+        # But let's check if we can use client's method first.
+        
+        if not self.maker_client:
+             raise Exception("Maker client not initialized")
 
-        # Fallback to REST API if websocket data is not available
-        self.logger.warning("WebSocket BBO data not available, falling back to REST API")
-        if not self.edgex_client:
-            raise Exception("EdgeX client not initialized")
-
-        depth_params = GetOrderBookDepthParams(contract_id=self.edgex_contract_id, limit=15)
-        order_book = await self.edgex_client.quote.get_order_book_depth(depth_params)
-        order_book_data = order_book['data']
-
-        order_book_entry = order_book_data[0]
-        bids = order_book_entry.get('bids', [])
-        asks = order_book_entry.get('asks', [])
-
-        best_bid = Decimal(bids[0]['price']) if bids and len(bids) > 0 else Decimal('0')
-        best_ask = Decimal(asks[0]['price']) if asks and len(asks) > 0 else Decimal('0')
-
-        return best_bid, best_ask
+        return await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
 
     async def place_bbo_order(self, side: str, quantity: Decimal) -> str:
-        """Place a BBO order on EdgeX."""
-        best_bid, best_ask = await self.fetch_edgex_bbo_prices()
+        """Place a BBO order on Maker exchange."""
+        best_bid, best_ask = await self.fetch_maker_bbo_prices()
 
+        # Determine price based on side (Maker strategy: Post-Only)
+        # Buy: Place at Best Ask - Tick (to be top of book or join bid? Strategy says:
+        # "Buy EdgeX @ Bid" in comments usually means joining the bid.
+        # But previous code was: 
+        # Buy: best_ask - tick (Trying to cross spread? No, post only would fail)
+        # Let's look at previous logic:
+        # if buy: price = best_ask - tick. 
+        # If spread is 1 tick, best_ask - tick = best_bid. So joining bid.
+        # If spread > 1 tick, best_ask - tick > best_bid. Improving bid.
+        
         if side.lower() == 'buy':
-            order_price = best_ask - self.edgex_tick_size
-            order_side = OrderSide.BUY
+            # Try to be competitive but passive
+            if best_ask > 0:
+                order_price = best_ask - self.maker_tick_size
+            else:
+                 # Fallback if no ask, maybe use last price or bid + tick?
+                 # For safety, if no ask, we can't determine ceiling.
+                 # But let's assume valid BBO.
+                 order_price = best_bid # Just join bid if no ask?
         else:
-            order_price = best_bid + self.edgex_tick_size
-            order_side = OrderSide.SELL
+            if best_bid > 0:
+                order_price = best_bid + self.maker_tick_size
+            else:
+                order_price = best_ask
 
-        self.edgex_client_order_id = str(int(time.time() * 1000))
-        order_result = await self.edgex_client.create_limit_order(
-            contract_id=self.edgex_contract_id,
-            size=str(quantity),
-            price=str(self.round_to_tick(order_price)),
-            side=order_side,
-            post_only=True,
-            client_order_id=self.edgex_client_order_id
+        self.maker_client_order_id = str(int(time.time() * 1000))
+        
+        # Use generic place_open_order (or we might need a specific place_limit_order in base?)
+        # BaseExchangeClient has place_open_order which takes direction.
+        # But here we want specific price control for BBO strategy.
+        # The BaseExchangeClient.place_open_order calculates price internally!
+        # Let's see BaseExchangeClient.place_open_order implementation.
+        # It does: price = best_ask - tick (for buy).
+        # So we can just use place_open_order!
+        
+        result = await self.maker_client.place_open_order(
+            contract_id=self.maker_contract_id,
+            quantity=quantity,
+            direction=side
         )
 
-        if not order_result or 'data' not in order_result:
-            raise Exception("Failed to place order")
+        if not result.success:
+            raise Exception(f"Failed to place order: {result.error_message}")
 
-        order_id = order_result['data'].get('orderId')
-        if not order_id:
-            raise Exception("No order ID in response")
+        return result.order_id
 
-        return order_id
+    async def place_maker_post_only_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
+        """Place a post-only order on Maker exchange."""
+        if not self.maker_client:
+            raise Exception("Maker client not initialized")
 
-    async def place_edgex_post_only_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
-        """Place a post-only order on EdgeX."""
-        if not self.edgex_client:
-            raise Exception("EdgeX client not initialized")
-
-        self.edgex_order_status = None
-        self.logger.info(f"[OPEN] [EdgeX] [{side}] Placing EdgeX POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
+        self.maker_order_status = None
+        self.logger.info(f"[OPEN] [Maker] [{side}] Placing Maker POST-ONLY order")
+        
+        try:
+            order_id = await self.place_bbo_order(side, quantity)
+        except Exception as e:
+            self.logger.error(f"❌ Error placing Maker order: {e}")
+            return False
 
         start_time = time.time()
         while not stop_flag:
-            if self.edgex_order_status == 'CANCELED':
+            # We need a way to check status. 
+            # In generic arb, we rely on WS updates calling handle_maker_order_update
+            # OR we need to poll if no WS.
+            
+            # If status is not updated via WS, we should poll.
+            if self.maker_order_status is None:
+                 # Poll status
+                 order_info = await self.maker_client.get_order_info(order_id)
+                 if order_info:
+                     self.update_maker_order_status(order_info.status)
+                     if order_info.status == 'FILLED':
+                         # Manually trigger update handler if polling found it filled
+                         self.handle_maker_order_update({
+                             'side': order_info.side,
+                             'filled_size': order_info.filled_size,
+                             'price': order_info.price,
+                             'status': order_info.status
+                         })
+
+            if self.maker_order_status == 'CANCELED':
                 return False
-            elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
+            elif self.maker_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED', None]:
                 await asyncio.sleep(0.5)
                 if time.time() - start_time > 5:
                     try:
-                        cancel_params = CancelOrderParams(order_id=order_id)
-                        cancel_result = await self.edgex_client.cancel_order(cancel_params)
-                        if not cancel_result or 'data' not in cancel_result:
-                            self.logger.error("❌ Error canceling EdgeX order")
+                        cancel_result = await self.maker_client.cancel_order(order_id)
+                        if not cancel_result.success:
+                            self.logger.error(f"❌ Error canceling Maker order: {cancel_result.error_message}")
                     except Exception as e:
-                        self.logger.error(f"❌ Error canceling EdgeX order: {e}")
-            elif self.edgex_order_status == 'FILLED':
+                        self.logger.error(f"❌ Error canceling Maker order: {e}")
+            elif self.maker_order_status == 'FILLED':
                 break
             else:
-                if self.edgex_order_status is not None:
-                    self.logger.error(f"❌ Unknown EdgeX order status: {self.edgex_order_status}")
+                if self.maker_order_status is not None:
+                    self.logger.error(f"❌ Unknown Maker order status: {self.maker_order_status}")
                     return False
                 else:
                     await asyncio.sleep(0.5)
         return True
 
-    def handle_edgex_order_update(self, order_data: dict):
-        """Handle EdgeX order update."""
+    def handle_maker_order_update(self, order_data: dict):
+        """Handle Maker order update."""
         side = order_data.get('side', '').lower()
         filled_size = order_data.get('filled_size')
         price = order_data.get('price', '0')
+        status = order_data.get('status')
+        
+        self.update_maker_order_status(status)
 
-        if side == 'buy':
-            lighter_side = 'sell'
-        else:
-            lighter_side = 'buy'
+        if status == 'FILLED':
+            if side == 'buy':
+                lighter_side = 'sell'
+            else:
+                lighter_side = 'buy'
 
-        self.current_lighter_side = lighter_side
-        self.current_lighter_quantity = filled_size
-        self.current_lighter_price = Decimal(price)
-        self.waiting_for_lighter_fill = True
+            self.current_lighter_side = lighter_side
+            self.current_lighter_quantity = filled_size
+            self.current_lighter_price = Decimal(price)
+            self.waiting_for_lighter_fill = True
 
-    def update_edgex_order_status(self, status: str):
-        """Update EdgeX order status."""
-        self.edgex_order_status = status
+    def update_maker_order_status(self, status: str):
+        """Update Maker order status."""
+        self.maker_order_status = status
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal,
                                          price: Decimal, stop_flag) -> Optional[str]:
@@ -279,6 +314,6 @@ class OrderManager:
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
 
-    def get_edgex_client_order_id(self) -> str:
-        """Get current EdgeX client order ID."""
-        return self.edgex_client_order_id
+    def get_maker_client_order_id(self) -> str:
+        """Get current Maker client order ID."""
+        return self.maker_client_order_id

@@ -19,6 +19,7 @@ class DataLogger:
         os.makedirs("logs", exist_ok=True)
 
         self.csv_filename = f"logs/{exchange}_{ticker}_trades.csv"
+        self.profit_csv_filename = f"logs/{exchange}_{ticker}_profit.csv"
         self.bbo_csv_filename = f"logs/{exchange}_{ticker}_bbo_data.csv"
         self.thresholds_json_filename = f"logs/{exchange}_{ticker}_thresholds.json"
 
@@ -29,6 +30,7 @@ class DataLogger:
         self.bbo_flush_interval = 10  # Flush every N writes
 
         self._initialize_csv_file()
+        self._initialize_profit_csv_file()
         self._initialize_bbo_csv_file()
 
     def _initialize_csv_file(self):
@@ -37,6 +39,13 @@ class DataLogger:
             with open(self.csv_filename, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+
+    def _initialize_profit_csv_file(self):
+        """Initialize Profit CSV file with headers if it doesn't exist."""
+        if not os.path.exists(self.profit_csv_filename):
+            with open(self.profit_csv_filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['timestamp', 'edgex_price', 'lighter_price', 'quantity', 'profit', 'direction'])
 
     def _initialize_bbo_csv_file(self):
         """Initialize BBO CSV file with headers if it doesn't exist."""
@@ -78,6 +87,21 @@ class DataLogger:
             ])
 
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+
+    def log_profit_to_csv(self, edgex_price: Decimal, lighter_price: Decimal, quantity: Decimal, profit: Decimal, direction: str):
+        """Log profit details to CSV file."""
+        timestamp = datetime.now(pytz.UTC).isoformat()
+
+        with open(self.profit_csv_filename, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                timestamp,
+                f"{edgex_price:.8f}",
+                f"{lighter_price:.8f}",
+                f"{quantity:.8f}",
+                f"{profit:.8f}",
+                direction
+            ])
 
     def log_bbo_to_csv(self, maker_bid: Decimal, maker_ask: Decimal, lighter_bid: Decimal,
                        lighter_ask: Decimal, long_maker: bool, short_maker: bool,

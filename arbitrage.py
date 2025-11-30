@@ -4,7 +4,9 @@ import argparse
 from decimal import Decimal
 import dotenv
 
-from strategy.edgex_arb import EdgexArb
+from strategy.generic_arb import GenericArb
+from exchanges.edgex import EdgeXClient
+from exchanges.backpack import BackpackClient
 
 
 def parse_arguments():
@@ -15,7 +17,7 @@ def parse_arguments():
         )
 
     parser.add_argument('--exchange', type=str, default='edgex',
-                        help='Exchange to use (edgex)')
+                        help='Exchange to use (edgex, backpack)')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -24,20 +26,23 @@ def parse_arguments():
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--max-position', type=Decimal, default=Decimal('0'),
                         help='Maximum position to hold (default: 0)')
-    parser.add_argument('--long-threshold', type=Decimal, default=Decimal('10'),
-                        help='Long threshold for edgeX (default: 10)')
-    parser.add_argument('--short-threshold', type=Decimal, default=Decimal('10'),
-                        help='Short threshold for edgeX (default: 10)')
+    parser.add_argument('--window-size', type=int, default=50,
+                        help='Window size for rolling stats (default: 50)')
+    parser.add_argument('--z-score', type=float, default=1.5,
+                        help='Z-score for dynamic thresholds (default: 1.5)')
+    parser.add_argument('--min-spread', type=float, default=0.0,
+                        help='Minimum spread required to trade (default: 0.0)')
     return parser.parse_args()
 
 
-def validate_exchange(exchange):
-    """Validate that the exchange is supported."""
-    supported_exchanges = ['edgex']
-    if exchange.lower() not in supported_exchanges:
-        print(f"Error: Unsupported exchange '{exchange}'")
-        print(f"Supported exchanges: {', '.join(supported_exchanges)}")
-        sys.exit(1)
+def get_exchange_client_class(exchange_name):
+    """Get the exchange client class based on name."""
+    if exchange_name == 'edgex':
+        return EdgeXClient
+    elif exchange_name == 'backpack':
+        return BackpackClient
+    else:
+        raise ValueError(f"Unsupported exchange: {exchange_name}")
 
 
 async def main():
@@ -46,21 +51,23 @@ async def main():
 
     dotenv.load_dotenv()
 
-    # Validate exchange
-    validate_exchange(args.exchange)
-
     try:
-        bot = EdgexArb(
+        exchange_class = get_exchange_client_class(args.exchange)
+        
+        bot = GenericArb(
+            exchange_client_class=exchange_class,
+            exchange_name=args.exchange,
             ticker=args.ticker.upper(),
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             max_position=args.max_position,
-            long_ex_threshold=Decimal(args.long_threshold),
-            short_ex_threshold=Decimal(args.short_threshold)
+            window_size=args.window_size,
+            z_score=args.z_score,
+            min_spread=args.min_spread
         )
 
         # Run the bot
-        await bot.run()
+        await bot.trading_loop()
 
     except KeyboardInterrupt:
         print("\nCross-Exchange Arbitrage interrupted by user")

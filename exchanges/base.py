@@ -63,7 +63,15 @@ class BaseExchangeClient(ABC):
 
     def __init__(self, config: Dict[str, Any]):
         """Initialize the exchange client with configuration."""
-        self.config = config
+        if isinstance(config, dict):
+            # Create a simple class to wrap the dictionary
+            class Config:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
+            self.config = Config(config)
+        else:
+            self.config = config
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:

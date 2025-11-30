@@ -1,4 +1,4 @@
-"""Main arbitrage trading bot for edgeX and Lighter exchanges."""
+"""Main arbitrage trading bot for Backpack and Lighter exchanges."""
 import asyncio
 import signal
 import logging
@@ -13,7 +13,9 @@ from collections import deque
 import math
 
 from lighter.signer_client import SignerClient
-from edgex_sdk import Client, WebSocketManager
+# from edgex_sdk import Client, WebSocketManager # Not needed for Backpack
+# Import Backpack adapter
+from exchanges.backpack import BackpackClient
 
 from .data_logger import DataLogger
 from .order_book_manager import OrderBookManager
@@ -23,18 +25,18 @@ from .position_tracker import PositionTracker
 
 
 class Config:
-    """Simple config class to wrap dictionary for edgeX client."""
+    """Simple config class to wrap dictionary."""
     def __init__(self, config_dict):
         for key, value in config_dict.items():
             setattr(self, key, value)
 
 
-class EdgexArb:
-    """Arbitrage trading bot: makes post-only orders on edgeX, and market orders on Lighter."""
+class BackpackArb:
+    """Arbitrage trading bot: makes post-only orders on Backpack, and market orders on Lighter."""
 
     def __init__(self, ticker: str, order_quantity: Decimal,
                  fill_timeout: int = 5, max_position: Decimal = Decimal('0'),
-                 window_size: int = 20, z_score: float = 2.0, min_spread: float = 0.0):
+                 window_size: int = 50, z_score: float = 1.5, min_spread: float = 0.0):
         """Initialize the arbitrage trading bot."""
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -55,28 +57,28 @@ class EdgexArb:
         self._setup_logger()
 
         # Initialize modules
-        self.data_logger = DataLogger(exchange="edgex", ticker=ticker, logger=self.logger)
+        self.data_logger = DataLogger(exchange="backpack", ticker=ticker, logger=self.logger)
         self.order_book_manager = OrderBookManager(self.logger)
+        # WS Manager might need adaptation for Backpack if we use WS
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
         self.order_manager = OrderManager(self.order_book_manager, self.logger)
 
         # Initialize clients (will be set later)
-        self.edgex_client = None
-        self.edgex_ws_manager = None
+        self.backpack_client = None
         self.lighter_client = None
 
         # Configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
         self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX'))
         self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX'))
-        self.edgex_account_id = os.getenv('EDGEX_ACCOUNT_ID')
-        self.edgex_stark_private_key = os.getenv('EDGEX_STARK_PRIVATE_KEY')
-        self.edgex_base_url = os.getenv('EDGEX_BASE_URL', 'https://pro.edgex.exchange')
-        self.edgex_ws_url = os.getenv('EDGEX_WS_URL', 'wss://quote.edgex.exchange')
+        
+        # Backpack config
+        self.backpack_api_key = os.getenv('BACKPACK_API_KEY')
+        self.backpack_api_secret = os.getenv('BACKPACK_API_SECRET')
 
         # Contract/market info (will be set during initialization)
-        self.edgex_contract_id = None
-        self.edgex_tick_size = None
+        self.backpack_contract_id = None # This will be the symbol, e.g. "SOL_USDC"
+        self.backpack_tick_size = None
         self.lighter_market_index = None
         self.base_amount_multiplier = None
         self.price_multiplier = None
@@ -91,9 +93,9 @@ class EdgexArb:
     def _setup_logger(self):
         """Setup logging configuration."""
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/edgex_{self.ticker}_log.txt"
+        self.log_filename = f"logs/backpack_{self.ticker}_log.txt"
 
-        self.logger = logging.getLogger(f"arbitrage_bot_{self.ticker}")
+        self.logger = logging.getLogger(f"arbitrage_bot_backpack_{self.ticker}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
@@ -126,7 +128,7 @@ class EdgexArb:
         """Setup callback functions for order updates."""
         self.ws_manager.set_callbacks(
             on_lighter_order_filled=self._handle_lighter_order_filled,
-            on_edgex_order_update=self._handle_edgex_order_update
+            on_edgex_order_update=self._handle_backpack_order_update # Reusing the name for now
         )
         self.order_manager.set_callbacks(
             on_order_filled=self._handle_lighter_order_filled
@@ -182,23 +184,23 @@ class EdgexArb:
             try:
                 lighter_price = order_data["avg_filled_price"]
                 lighter_qty = Decimal(order_data["filled_base_amount"])
-                edgex_price = self.order_manager.current_lighter_price
+                backpack_price = self.order_manager.current_lighter_price # Using same var name in manager
                 
-                if edgex_price and edgex_price > 0:
+                if backpack_price and backpack_price > 0:
                     profit = Decimal('0')
                     direction = ""
                     
-                    if order_data["side"] == "SHORT": # Lighter Sell, EdgeX Buy (Long EdgeX)
-                        profit = (lighter_price - edgex_price) * lighter_qty
-                        direction = "Long EdgeX / Short Lighter"
-                    else: # Lighter Buy, EdgeX Sell (Short EdgeX)
-                        profit = (edgex_price - lighter_price) * lighter_qty
-                        direction = "Short EdgeX / Long Lighter"
+                    if order_data["side"] == "SHORT": # Lighter Sell, Backpack Buy (Long Backpack)
+                        profit = (lighter_price - backpack_price) * lighter_qty
+                        direction = "Long Backpack / Short Lighter"
+                    else: # Lighter Buy, Backpack Sell (Short Backpack)
+                        profit = (backpack_price - lighter_price) * lighter_qty
+                        direction = "Short Backpack / Long Lighter"
                         
-                    self.logger.info(f"💰 Profit: {profit:.6f} (EdgeX: {edgex_price:.2f}, Lighter: {lighter_price:.2f}) [{direction}]")
+                    self.logger.info(f"💰 Profit: {profit:.6f} (Backpack: {backpack_price:.2f}, Lighter: {lighter_price:.2f}) [{direction}]")
                     
                     self.data_logger.log_profit_to_csv(
-                        edgex_price=edgex_price,
+                        edgex_price=backpack_price, # Reusing column name
                         lighter_price=lighter_price,
                         quantity=lighter_qty,
                         profit=profit,
@@ -214,19 +216,15 @@ class EdgexArb:
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
 
-    def _handle_edgex_order_update(self, order: dict):
-        """Handle EdgeX order update from WebSocket."""
+    def _handle_backpack_order_update(self, order: dict):
+        """Handle Backpack order update."""
+        # For now, since we are using REST for Backpack, this might not be triggered by WS.
+        # But if we poll or implement WS, this structure is useful.
         try:
-            if order.get('contractId') != self.edgex_contract_id:
-                return
-
-            if order.get('clientOrderId') != self.order_manager.get_edgex_client_order_id():
-                return
-
-            order_id = order.get('id')
+            order_id = order.get('order_id')
             status = order.get('status')
             side = order.get('side', '').lower()
-            filled_size = Decimal(order.get('cumMatchSize', '0'))
+            filled_size = Decimal(order.get('filled_size', '0'))
             size = Decimal(order.get('size', '0'))
             price = order.get('price', '0')
 
@@ -235,56 +233,52 @@ class EdgexArb:
             else:
                 order_type = "CLOSE"
 
-            if status == 'CANCELED' and filled_size > 0:
-                status = 'FILLED'
-
             # Update order status
-            self.order_manager.update_edgex_order_status(status)
+            self.order_manager.update_edgex_order_status(status) # Reusing method
 
             # Handle filled orders
             if status == 'FILLED' and filled_size > 0:
                 if side == 'buy':
                     if self.position_tracker:
-                        self.position_tracker.update_edgex_position(filled_size)
+                        self.position_tracker.update_edgex_position(filled_size) # Reusing method
                 else:
                     if self.position_tracker:
-                        self.position_tracker.update_edgex_position(-filled_size)
+                        self.position_tracker.update_edgex_position(-filled_size) # Reusing method
 
                 self.logger.info(
-                    f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {filled_size} @ {price}")
+                    f"[{order_id}] [{order_type}] [Backpack] [{status}]: {filled_size} @ {price}")
 
                 if filled_size > 0.0001:
-                    # Log EdgeX trade to CSV
+                    # Log Backpack trade to CSV
                     self.data_logger.log_trade_to_csv(
-                        exchange='edgeX',
+                        exchange='backpack',
                         side=side,
                         price=str(price),
                         quantity=str(filled_size)
                     )
 
                 # Trigger Lighter order placement
-                self.order_manager.handle_edgex_order_update({
+                self.order_manager.handle_edgex_order_update({ # Reusing method
                     'order_id': order_id,
                     'side': side,
                     'status': status,
                     'size': size,
                     'price': price,
-                    'contract_id': self.edgex_contract_id,
+                    'contract_id': self.backpack_contract_id,
                     'filled_size': filled_size
                 })
             elif status != 'FILLED':
                 if status == 'OPEN':
-                    self.logger.info(f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {size} @ {price}")
+                    self.logger.info(f"[{order_id}] [{order_type}] [Backpack] [{status}]: {size} @ {price}")
                 else:
                     self.logger.info(
-                        f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {filled_size} @ {price}")
+                        f"[{order_id}] [{order_type}] [Backpack] [{status}]: {filled_size} @ {price}")
 
         except Exception as e:
-            self.logger.error(f"Error handling EdgeX order update: {e}")
+            self.logger.error(f"Error handling Backpack order update: {e}")
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
-        # Prevent multiple shutdown calls
         if self.stop_flag:
             return
 
@@ -317,35 +311,6 @@ class EdgexArb:
             except Exception:
                 pass
 
-        # Note: Async cleanup will be handled in run() finally block
-
-    async def _async_cleanup(self):
-        """Async cleanup for aiohttp sessions and other async resources."""
-        if self._cleanup_done:
-            return
-
-        self._cleanup_done = True
-
-        # Close EdgeX client (closes aiohttp sessions) with timeout
-        try:
-            if self.edgex_client:
-                await asyncio.wait_for(
-                    self.edgex_client.close(),
-                    timeout=2.0
-                )
-                self.logger.info("🔌 EdgeX client closed")
-        except asyncio.TimeoutError:
-            self.logger.warning("⚠️ Timeout closing EdgeX client, forcing shutdown")
-        except Exception as e:
-            self.logger.error(f"Error closing EdgeX client: {e}")
-
-        # Close EdgeX WebSocket manager connections
-        try:
-            if self.edgex_ws_manager:
-                self.edgex_ws_manager.disconnect_all()
-        except Exception as e:
-            self.logger.error(f"Error disconnecting EdgeX WebSocket manager: {e}")
-
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
         signal.signal(signal.SIGINT, self.shutdown)
@@ -372,26 +337,17 @@ class EdgexArb:
             self.logger.info("✅ Lighter client initialized successfully")
         return self.lighter_client
 
-    def initialize_edgex_client(self):
-        """Initialize the EdgeX client."""
-        if not self.edgex_account_id or not self.edgex_stark_private_key:
-            raise ValueError(
-                "EDGEX_ACCOUNT_ID and EDGEX_STARK_PRIVATE_KEY must be set in environment variables")
-
-        self.edgex_client = Client(
-            base_url=self.edgex_base_url,
-            account_id=int(self.edgex_account_id),
-            stark_private_key=self.edgex_stark_private_key
-        )
-
-        self.edgex_ws_manager = WebSocketManager(
-            base_url=self.edgex_ws_url,
-            account_id=int(self.edgex_account_id),
-            stark_pri_key=self.edgex_stark_private_key
-        )
-
-        self.logger.info("✅ EdgeX client initialized successfully")
-        return self.edgex_client
+    def initialize_backpack_client(self):
+        """Initialize the Backpack client."""
+        self.backpack_client = BackpackClient({
+            'ticker': self.ticker,
+            'contract_id': self.ticker, # Will be updated
+            'quantity': self.order_quantity,
+            'tick_size': Decimal('0.01') # Default, will be updated
+        })
+        
+        self.logger.info("✅ Backpack client initialized successfully")
+        return self.backpack_client
 
     def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
@@ -423,55 +379,47 @@ class EdgexArb:
             self.logger.error(f"⚠️ Error getting market config: {e}")
             raise
 
-    async def get_edgex_contract_info(self) -> Tuple[str, Decimal]:
-        """Get EdgeX contract ID and tick size."""
-        if not self.edgex_client:
-            raise Exception("EdgeX client not initialized")
-
-        response = await self.edgex_client.get_metadata()
-        data = response.get('data', {})
-        if not data:
-            raise ValueError("Failed to get EdgeX metadata")
-
-        contract_list = data.get('contractList', [])
-        if not contract_list:
-            raise ValueError("Failed to get EdgeX contract list")
-
-        current_contract = None
-        for c in contract_list:
-            if c.get('contractName') == self.ticker + 'USD':
-                current_contract = c
-                break
-
-        if not current_contract:
-            raise ValueError(f"Failed to get contract ID for ticker {self.ticker}")
-
-        contract_id = current_contract.get('contractId')
-        min_quantity = Decimal(current_contract.get('minOrderSize'))
-        tick_size = Decimal(current_contract.get('tickSize'))
-
-        if self.order_quantity < min_quantity:
-            raise ValueError(
-                f"Order quantity is less than min quantity: {self.order_quantity} < {min_quantity}")
-
-        return contract_id, tick_size
+    async def get_backpack_contract_info(self) -> Tuple[str, Decimal]:
+        """Get Backpack contract info."""
+        # For Backpack, the contract_id is the symbol itself, e.g. "SOL_USDC"
+        # We need to fetch tick size from public API
+        try:
+            markets = await asyncio.to_thread(self.backpack_client.public.get_markets)
+            for m in markets:
+                if m['symbol'] == self.ticker:
+                    tick_size = Decimal(m['filters']['price']['tickSize'])
+                    min_quantity = Decimal(m['filters']['quantity']['minQuantity'])
+                    
+                    if self.order_quantity < min_quantity:
+                        raise ValueError(f"Order quantity {self.order_quantity} < min quantity {min_quantity}")
+                        
+                    return self.ticker, tick_size
+            raise ValueError(f"Market {self.ticker} not found on Backpack")
+        except Exception as e:
+            self.logger.error(f"Error getting Backpack info: {e}")
+            raise
 
     async def trading_loop(self):
         """Main trading loop implementing the strategy."""
-        self.logger.info(f"🚀 Starting arbitrage bot for {self.ticker}")
+        self.logger.info(f"🚀 Starting Backpack arbitrage bot for {self.ticker}")
 
         # Initialize clients
         try:
             self.initialize_lighter_client()
-            self.initialize_edgex_client()
+            self.initialize_backpack_client()
 
             # Get contract info
-            self.edgex_contract_id, self.edgex_tick_size = await self.get_edgex_contract_info()
+            self.backpack_contract_id, self.backpack_tick_size = await self.get_backpack_contract_info()
+            
+            # Update client config with correct tick size
+            self.backpack_client.config.tick_size = self.backpack_tick_size
+            self.backpack_client.config.contract_id = self.backpack_contract_id
+            
             (self.lighter_market_index, self.base_amount_multiplier,
              self.price_multiplier, self.tick_size) = self.get_lighter_market_config()
 
             self.logger.info(
-                f"Contract info loaded - EdgeX: {self.edgex_contract_id}, "
+                f"Contract info loaded - Backpack: {self.backpack_contract_id}, "
                 f"Lighter: {self.lighter_market_index}")
 
         except Exception as e:
@@ -479,50 +427,31 @@ class EdgexArb:
             return
 
         # Initialize position tracker
+        # We need to adapt PositionTracker to work with Backpack or create a new one.
+        # For now, let's assume we can pass the backpack client as 'edgex_client' if interfaces match enough
+        # or we mock it. PositionTracker uses get_account_positions which we implemented.
         self.position_tracker = PositionTracker(
             self.ticker,
-            self.edgex_client,
-            self.edgex_contract_id,
+            self.backpack_client, # Passing backpack client
+            self.backpack_contract_id,
             self.lighter_base_url,
             self.account_index,
             self.logger
         )
 
         # Configure modules
-        self.order_manager.set_edgex_config(
-            self.edgex_client, self.edgex_contract_id, self.edgex_tick_size)
+        self.order_manager.set_edgex_config( # Reusing method name
+            self.backpack_client, self.backpack_contract_id, self.backpack_tick_size)
         self.order_manager.set_lighter_config(
             self.lighter_client, self.lighter_market_index,
             self.base_amount_multiplier, self.price_multiplier, self.tick_size)
 
-        self.ws_manager.set_edgex_ws_manager(self.edgex_ws_manager, self.edgex_contract_id)
+        # WS Manager setup
+        # For Backpack, we might not have WS setup yet in this iteration.
+        # We will rely on REST polling for BBO in the loop if WS is not ready.
+        
         self.ws_manager.set_lighter_config(
             self.lighter_client, self.lighter_market_index, self.account_index)
-
-        # Setup EdgeX websocket
-        try:
-            await self.ws_manager.setup_edgex_websocket()
-            self.logger.info("✅ EdgeX WebSocket connection established")
-
-            # Wait for initial order book data
-            self.logger.info("⏳ Waiting for initial EdgeX order book data...")
-            timeout = 10
-            start_time = time.time()
-            while not self.order_book_manager.edgex_order_book_ready and not self.stop_flag:
-                if time.time() - start_time > timeout:
-                    self.logger.warning(
-                        f"⚠️ Timeout waiting for WebSocket order book data after {timeout}s")
-                    break
-                await asyncio.sleep(0.5)
-
-            if self.order_book_manager.edgex_order_book_ready:
-                self.logger.info("✅ WebSocket order book data received")
-            else:
-                self.logger.warning("⚠️ WebSocket order book not ready, will use REST API fallback")
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to setup EdgeX websocket: {e}")
-            return
 
         # Setup Lighter websocket
         try:
@@ -559,29 +488,23 @@ class EdgexArb:
         # Main trading loop
         while not self.stop_flag:
             try:
-                ex_best_bid, ex_best_ask = await asyncio.wait_for(
-                    self.order_manager.fetch_edgex_bbo_prices(),
-                    timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                self.logger.warning("⚠️ Timeout fetching EdgeX BBO prices")
-                await asyncio.sleep(0.5)
-                continue
+                # Fetch Backpack BBO via REST (since we don't have WS yet)
+                bp_best_bid, bp_best_ask = await self.backpack_client.fetch_bbo_prices(self.backpack_contract_id)
             except Exception as e:
-                self.logger.error(f"⚠️ Error fetching EdgeX BBO prices: {e}")
+                self.logger.error(f"⚠️ Error fetching Backpack BBO prices: {e}")
                 await asyncio.sleep(0.5)
                 continue
 
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
 
             # Calculate mid prices and spread
-            if not (lighter_bid and lighter_ask and ex_best_bid and ex_best_ask):
+            if not (lighter_bid and lighter_ask and bp_best_bid and bp_best_ask):
                 await asyncio.sleep(0.1)
                 continue
 
             lighter_mid = (float(lighter_bid) + float(lighter_ask)) / 2
-            ex_mid = (float(ex_best_bid) + float(ex_best_ask)) / 2
-            current_spread = lighter_mid - ex_mid
+            bp_mid = (float(bp_best_bid) + float(bp_best_ask)) / 2
+            current_spread = lighter_mid - bp_mid
 
             # Update stats
             self.current_mean, self.current_std = self._update_spread_stats(current_spread)
@@ -596,38 +519,36 @@ class EdgexArb:
             lower_threshold = self.current_mean - (self.z_score * self.current_std)
 
             # Determine if we should trade
-            long_ex = False
-            short_ex = False
+            long_bp = False
+            short_bp = False
             
             # Open Logic
-            # Spread > Upper -> Lighter expensive, EdgeX cheap -> Sell Lighter, Buy EdgeX (Long EdgeX)
+            # Spread > Upper -> Lighter expensive, Backpack cheap -> Sell Lighter, Buy Backpack (Long Backpack)
             if current_spread > upper_threshold and current_spread > self.min_spread:
-                long_ex = True
-            # Spread < Lower -> Lighter cheap, EdgeX expensive -> Buy Lighter, Sell EdgeX (Short EdgeX)
+                long_bp = True
+            # Spread < Lower -> Lighter cheap, Backpack expensive -> Buy Lighter, Sell Backpack (Short Backpack)
             elif current_spread < lower_threshold and current_spread < -self.min_spread:
-                short_ex = True
+                short_bp = True
 
             # Close Logic (Mean Reversion)
-            # If we are Long EdgeX (Short Lighter), we want spread to decrease back to mean
-            # If we are Short EdgeX (Long Lighter), we want spread to increase back to mean
-            close_long_ex = False
-            close_short_ex = False
+            close_long_bp = False
+            close_short_bp = False
             
-            current_pos = self.position_tracker.get_current_edgex_position()
+            current_pos = self.position_tracker.get_current_edgex_position() # Reusing method
             
             if current_pos > 0 and current_spread < self.current_mean:
-                close_long_ex = True
+                close_long_bp = True
             elif current_pos < 0 and current_spread > self.current_mean:
-                close_short_ex = True
+                close_short_bp = True
 
             # Log BBO data
             self.data_logger.log_bbo_to_csv(
-                maker_bid=ex_best_bid,
-                maker_ask=ex_best_ask,
+                maker_bid=bp_best_bid,
+                maker_ask=bp_best_ask,
                 lighter_bid=lighter_bid if lighter_bid else Decimal('0'),
                 lighter_ask=lighter_ask if lighter_ask else Decimal('0'),
-                long_maker=long_ex,
-                short_maker=short_ex,
+                long_maker=long_bp,
+                short_maker=short_bp,
                 long_maker_threshold=Decimal(str(upper_threshold)),
                 short_maker_threshold=Decimal(str(lower_threshold))
             )
@@ -636,29 +557,20 @@ class EdgexArb:
                 break
 
             # Execute trades
-            # Execute trades
-            if (current_pos < self.max_position and long_ex):
+            if (current_pos < self.max_position and long_bp):
                 await self._execute_long_trade()
-            elif (current_pos > -1 * self.max_position and short_ex):
+            elif (current_pos > -1 * self.max_position and short_bp):
                 await self._execute_short_trade()
             # Close positions logic
-            elif close_long_ex:
-                # To close a long EdgeX position, we need to Sell EdgeX (Short trade logic)
-                # But we need to be careful not to open a new Short position if we just want to close
-                # For simplicity in this structure, we can use _execute_short_trade but we might need to ensure we only close
-                # However, the current _execute_short_trade opens a full order_quantity. 
-                # If we want to strictly CLOSE, we should check if we have position.
-                # The user asked to change open/close logic. 
-                # Current implementation is simple: if signal, trade fixed quantity.
-                # I will assume we just trigger the opposite trade to close.
+            elif close_long_bp:
                 await self._execute_short_trade()
-            elif close_short_ex:
+            elif close_short_bp:
                 await self._execute_long_trade()
             else:
                 await asyncio.sleep(0.05)
 
     async def _execute_long_trade(self):
-        """Execute a long trade (buy on EdgeX, sell on Lighter)."""
+        """Execute a long trade (buy on Backpack, sell on Lighter)."""
         if self.stop_flag:
             return
 
@@ -674,14 +586,7 @@ class EdgexArb:
                 self.position_tracker.get_lighter_position(),
                 timeout=3.0
             )
-        except asyncio.TimeoutError:
-            if self.stop_flag:
-                return
-            self.logger.warning("⚠️ Timeout getting positions")
-            return
         except Exception as e:
-            if self.stop_flag:
-                return
             self.logger.error(f"⚠️ Error getting positions: {e}")
             return
 
@@ -689,7 +594,7 @@ class EdgexArb:
             return
 
         self.logger.info(
-            f"EdgeX position: {self.position_tracker.edgex_position} | "
+            f"Backpack position: {self.position_tracker.edgex_position} | "
             f"Lighter position: {self.position_tracker.lighter_position}")
 
         if abs(self.position_tracker.get_net_position()) > self.order_quantity * 2:
@@ -707,8 +612,6 @@ class EdgexArb:
             if not order_filled or self.stop_flag:
                 return
         except Exception as e:
-            if self.stop_flag:
-                return
             self.logger.error(f"⚠️ Error in trading loop: {e}")
             self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
             sys.exit(1)
@@ -730,7 +633,7 @@ class EdgexArb:
                 break
 
     async def _execute_short_trade(self):
-        """Execute a short trade (sell on EdgeX, buy on Lighter)."""
+        """Execute a short trade (sell on Backpack, buy on Lighter)."""
         if self.stop_flag:
             return
 
@@ -746,14 +649,7 @@ class EdgexArb:
                 self.position_tracker.get_lighter_position(),
                 timeout=3.0
             )
-        except asyncio.TimeoutError:
-            if self.stop_flag:
-                return
-            self.logger.warning("⚠️ Timeout getting positions")
-            return
         except Exception as e:
-            if self.stop_flag:
-                return
             self.logger.error(f"⚠️ Error getting positions: {e}")
             return
 
@@ -761,7 +657,7 @@ class EdgexArb:
             return
 
         self.logger.info(
-            f"EdgeX position: {self.position_tracker.edgex_position} | "
+            f"Backpack position: {self.position_tracker.edgex_position} | "
             f"Lighter position: {self.position_tracker.lighter_position}")
 
         if abs(self.position_tracker.get_net_position()) > self.order_quantity * 2:
@@ -779,8 +675,6 @@ class EdgexArb:
             if not order_filled or self.stop_flag:
                 return
         except Exception as e:
-            if self.stop_flag:
-                return
             self.logger.error(f"⚠️ Error in trading loop: {e}")
             self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
             sys.exit(1)
@@ -799,25 +693,3 @@ class EdgexArb:
             await asyncio.sleep(0.01)
             if time.time() - start_time > 180:
                 self.logger.error("❌ Timeout waiting for trade completion")
-                break
-
-    async def run(self):
-        """Run the arbitrage bot."""
-        self.setup_signal_handlers()
-
-        try:
-            await self.trading_loop()
-        except KeyboardInterrupt:
-            self.logger.info("\n🛑 Received interrupt signal...")
-        except asyncio.CancelledError:
-            self.logger.info("\n🛑 Task cancelled...")
-        finally:
-            self.logger.info("🔄 Cleaning up...")
-            self.shutdown()
-            # Ensure async cleanup is done with timeout
-            try:
-                await asyncio.wait_for(self._async_cleanup(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self.logger.warning("⚠️ Cleanup timeout, forcing exit")
-            except Exception as e:
-                self.logger.error(f"Error during cleanup: {e}")
