@@ -88,6 +88,24 @@ class PositionTracker:
 
         return current_position
 
+    async def get_lighter_balance(self) -> Decimal:
+        """Get Lighter available balance (collateral)."""
+        url = f"{self.lighter_base_url}/api/v1/account"
+        headers = {"accept": "application/json"}
+        params = {"by": "index", "value": self.account_index}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'accounts' in data and data['accounts']:
+                return Decimal(data['accounts'][0].get('available_balance', '0'))
+            return Decimal('0')
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error getting Lighter balance: {e}")
+            return Decimal('0')
+
     def update_edgex_position(self, delta: Decimal):
         """Update EdgeX position by delta."""
         self.edgex_position += delta

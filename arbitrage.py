@@ -3,6 +3,10 @@ import sys
 import argparse
 from decimal import Decimal
 import dotenv
+import os
+import certifi
+
+os.environ['SSL_CERT_FILE'] = certifi.where()
 
 from strategy.generic_arb import GenericArb
 from exchanges.edgex import EdgeXClient
@@ -32,6 +36,10 @@ def parse_arguments():
                         help='Z-score for dynamic thresholds (default: 1.5)')
     parser.add_argument('--min-spread', type=float, default=0.0,
                         help='Minimum spread required to trade (default: 0.0)')
+    parser.add_argument('--lighter-fee', type=float, default=0.001,
+                        help='Lighter taker fee rate (default: 0.001 = 0.1%%)')
+    parser.add_argument('--backpack-fee', type=float, default=0.0,
+                        help='Backpack maker fee rate (default: 0.0)')
     return parser.parse_args()
 
 
@@ -63,7 +71,9 @@ async def main():
             max_position=args.max_position,
             window_size=args.window_size,
             z_score=args.z_score,
-            min_spread=args.min_spread
+            min_spread=args.min_spread,
+            lighter_fee=args.lighter_fee,
+            backpack_fee=args.backpack_fee
         )
 
         # Run the bot

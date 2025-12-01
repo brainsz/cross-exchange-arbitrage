@@ -136,6 +136,20 @@ class OrderBookManager:
 
         return best_bid, best_ask
 
+    def update_lighter_bbo(self):
+        """Update Lighter best bid/ask prices."""
+        best_bid, best_ask = self.get_lighter_best_levels()
+        
+        if best_bid:
+            self.lighter_best_bid = best_bid[0]
+        else:
+            self.lighter_best_bid = None
+            
+        if best_ask:
+            self.lighter_best_ask = best_ask[0]
+        else:
+            self.lighter_best_ask = None
+
     def get_lighter_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         """Get Lighter best bid/ask prices."""
         return self.lighter_best_bid, self.lighter_best_ask
@@ -150,10 +164,40 @@ class OrderBookManager:
         mid_price = (best_bid[0] + best_ask[0]) / Decimal('2')
         return mid_price
 
-    def update_lighter_bbo(self):
-        """Update Lighter best bid/ask from order book."""
-        best_bid, best_ask = self.get_lighter_best_levels()
-        if best_bid is not None:
-            self.lighter_best_bid = best_bid[0]
         if best_ask is not None:
             self.lighter_best_ask = best_ask[0]
+
+    def check_lighter_liquidity(self, side: str, price: Decimal, quantity: Decimal) -> bool:
+        """
+        Check if there is sufficient liquidity on Lighter.
+        side: 'buy' (we want to buy on Lighter) or 'sell' (we want to sell on Lighter)
+        price: The worst acceptable price (limit).
+        quantity: The amount we need to fill.
+        """
+        # If we want to BUY on Lighter, we look at ASKS
+        # If we want to SELL on Lighter, we look at BIDS
+        book_side = 'asks' if side.lower() == 'buy' else 'bids'
+        
+        available_qty = Decimal('0')
+        
+        # Sort levels: 
+        # For ASKS (buying), we want lowest prices first.
+        # For BIDS (selling), we want highest prices first.
+        sorted_levels = sorted(self.lighter_order_book[book_side].items(), 
+                               key=lambda x: x[0], 
+                               reverse=(book_side == 'bids'))
+        
+        for level_price, level_size in sorted_levels:
+            # Check price limit
+            if book_side == 'asks':
+                if level_price > price: # Too expensive
+                    break
+            else: # bids
+                if level_price < price: # Too cheap
+                    break
+            
+            available_qty += level_size
+            if available_qty >= quantity:
+                return True
+                
+        return False
