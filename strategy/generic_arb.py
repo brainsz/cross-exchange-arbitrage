@@ -33,7 +33,9 @@ class GenericArb:
                  max_position: Decimal = Decimal('0'),
                  window_size: int = 50, 
                  z_score: float = 1.5, 
-                 min_spread: float = 0.0):
+                 min_spread: float = 0.0,
+                 lighter_fee: float = 0.001,
+                 backpack_fee: float = 0.0):
         """Initialize the arbitrage trading bot."""
         self.exchange_client_class = exchange_client_class
         self.exchange_name = exchange_name
@@ -48,6 +50,8 @@ class GenericArb:
         self.window_size = window_size
         self.z_score = z_score
         self.min_spread = min_spread
+        self.lighter_fee = Decimal(str(lighter_fee))
+        self.backpack_fee = Decimal(str(backpack_fee))
         self.spread_history = deque(maxlen=window_size)
         self.current_mean = None
         self.current_std = None
@@ -67,8 +71,16 @@ class GenericArb:
 
         # Configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
-        self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX'))
-        self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX'))
+        
+        lighter_account_index = os.getenv('LIGHTER_ACCOUNT_INDEX')
+        if lighter_account_index is None:
+            raise ValueError("Environment variable 'LIGHTER_ACCOUNT_INDEX' is not set. Please check your .env file.")
+        self.account_index = int(lighter_account_index)
+
+        lighter_api_key_index = os.getenv('LIGHTER_API_KEY_INDEX')
+        if lighter_api_key_index is None:
+            raise ValueError("Environment variable 'LIGHTER_API_KEY_INDEX' is not set. Please check your .env file.")
+        self.api_key_index = int(lighter_api_key_index)
         
         # Contract/market info (will be set during initialization)
         self.maker_contract_id = None 
@@ -190,14 +202,21 @@ class GenericArb:
                     else: # Lighter Buy, Maker Sell (Short Maker)
                         profit = (maker_price - lighter_price) * lighter_qty
                         direction = f"Short {self.exchange_name} / Long Lighter"
-                        
-                    self.logger.info(f"💰 Profit: {profit:.6f} ({self.exchange_name}: {maker_price:.2f}, Lighter: {lighter_price:.2f}) [{direction}]")
+                    
+                    # Calculate fees
+                    lighter_fee_cost = lighter_price * lighter_qty * self.lighter_fee
+                    maker_fee_cost = maker_price * lighter_qty * self.backpack_fee
+                    total_fee = lighter_fee_cost + maker_fee_cost
+                    net_profit = profit - total_fee
+
+                    self.logger.info(f"💰 Gross Profit: {profit:.6f} | Net Profit: {net_profit:.6f} (Fees: {total_fee:.6f})")
+                    self.logger.info(f"   ({self.exchange_name}: {maker_price:.2f}, Lighter: {lighter_price:.2f}) [{direction}]")
                     
                     self.data_logger.log_profit_to_csv(
                         edgex_price=maker_price, # Keeping column name for compatibility
                         lighter_price=lighter_price,
                         quantity=lighter_qty,
-                        profit=profit,
+                        profit=net_profit, # Log Net Profit
                         direction=direction
                     )
             except Exception as e:
@@ -417,6 +436,26 @@ class GenericArb:
                 f"Contract info loaded - {self.exchange_name}: {self.maker_contract_id}, "
                 f"Lighter: {self.lighter_market_index}")
 
+            # Calculate and log breakeven spread
+            # Assuming price is roughly the mid price of Lighter for estimation
+            try:
+                # Fetch initial price for estimation
+                est_price_tuple = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
+                est_price = (est_price_tuple[0] + est_price_tuple[1]) / 2
+                if est_price == 0:
+                    est_price = Decimal('90000') # Fallback
+                
+                # Assuming self.lighter_fee and self.backpack_fee are Decimal values representing percentages (e.g., 0.001 for 0.1%)
+                # And that these are initialized in __init__
+                breakeven = est_price * (self.lighter_fee + self.backpack_fee)
+                self.logger.info(f"ℹ️  Fee Rates - Lighter: {self.lighter_fee*100}%, {self.exchange_name}: {self.backpack_fee*100}%")
+                self.logger.info(f"ℹ️  Estimated Breakeven Spread: ~{breakeven:.2f} USDC (at price {est_price:.2f})")
+                
+                if Decimal(str(self.min_spread)) < breakeven:
+                    self.logger.warning(f"⚠️  WARNING: min-spread ({self.min_spread}) is less than estimated breakeven ({breakeven:.2f}). You may lose money on fees.")
+            except Exception as e:
+                self.logger.warning(f"Could not calculate breakeven: {e}")
+
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
             self.logger.error(traceback.format_exc())
@@ -486,13 +525,25 @@ class GenericArb:
 
         # Main trading loop
         while not self.stop_flag:
-            try:
-                # Fetch Maker BBO
-                # BaseExchangeClient has fetch_bbo_prices
-                maker_best_bid, maker_best_ask = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error fetching {self.exchange_name} BBO prices: {e}")
-                await asyncio.sleep(0.5)
+
+            # Fetch Maker BBO
+            # BaseExchangeClient has fetch_bbo_prices
+            retry_count = 0
+            max_retries = 3
+            while retry_count < max_retries:
+                try:
+                    maker_best_bid, maker_best_ask = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count == max_retries:
+                        self.logger.error(f"⚠️ Error fetching {self.exchange_name} BBO prices after {max_retries} retries: {e}")
+                        maker_best_bid, maker_best_ask = Decimal('0'), Decimal('0')
+                    else:
+                        await asyncio.sleep(0.5 * retry_count)
+            
+            if maker_best_bid == 0 and maker_best_ask == 0:
+                await asyncio.sleep(1)
                 continue
 
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
@@ -567,6 +618,37 @@ class GenericArb:
             else:
                 await asyncio.sleep(0.05)
 
+    async def _validate_trade_conditions(self, lighter_side: str, quantity: Decimal, limit_price: Decimal) -> bool:
+        """
+        Validate if Lighter has enough balance and liquidity to execute the hedge.
+        lighter_side: 'buy' or 'sell'
+        quantity: Amount to trade
+        limit_price: Worst acceptable price
+        """
+        # 1. Check Liquidity
+        has_liquidity = self.order_book_manager.check_lighter_liquidity(lighter_side, limit_price, quantity)
+        if not has_liquidity:
+            self.logger.warning(f"⚠️ Insufficient Lighter liquidity to {lighter_side} {quantity} @ {limit_price}")
+            return False
+
+        # 2. Check Balance
+        # Approximate margin needed (assuming 1x leverage for safety check, though actual is higher)
+        # If buying: need USDC ~ price * quantity
+        # If selling: need USDC collateral (for perp) ~ price * quantity / leverage
+        # Since we don't know leverage exactly, let's assume we need at least 10% of notional value as free collateral
+        try:
+            balance = await self.position_tracker.get_lighter_balance()
+            required_margin = (limit_price * quantity) * Decimal('0.1') # 10x leverage assumption safety buffer
+            
+            if balance < required_margin:
+                self.logger.warning(f"⚠️ Insufficient Lighter balance: {balance} < {required_margin} (required)")
+                return False
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not validate Lighter balance: {e}")
+            # Don't block if check fails, but log warning
+        
+        return True
+
     async def _execute_long_trade(self):
         """Execute a long trade (buy on Maker, sell on Lighter)."""
         if self.stop_flag:
@@ -600,6 +682,18 @@ class GenericArb:
                 f"❌ Position diff is too large: {self.position_tracker.get_net_position()}")
             sys.exit(1)
 
+        # Validate Lighter conditions (Liquidity & Balance)
+        # For Long Trade: Buy Maker, Sell Lighter
+        # We need to check if we can SELL on Lighter (Bids)
+        best_bid, _ = self.order_book_manager.get_lighter_best_levels()
+        if not best_bid:
+            self.logger.warning("⚠️ Lighter order book empty, skipping trade")
+            return
+
+        limit_price = best_bid[0] * Decimal('0.995') # Allow 0.5% slippage for validation
+        if not await self._validate_trade_conditions('sell', self.order_quantity, limit_price):
+            return
+
         self.order_manager.order_execution_complete = False
         self.order_manager.waiting_for_lighter_fill = False
 
@@ -617,12 +711,42 @@ class GenericArb:
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
             if self.order_manager.waiting_for_lighter_fill:
-                await self.order_manager.place_lighter_market_order(
-                    self.order_manager.current_lighter_side,
-                    self.order_manager.current_lighter_quantity,
-                    self.order_manager.current_lighter_price,
-                    self.stop_flag
-                )
+                # Retry logic for Lighter order
+                max_retries = 5
+                for i in range(max_retries):
+                    tx_hash = await self.order_manager.place_lighter_market_order(
+                        self.order_manager.current_lighter_side,
+                        self.order_manager.current_lighter_quantity,
+                        self.order_manager.current_lighter_price,
+                        self.stop_flag
+                    )
+                    if tx_hash:
+                        break
+                    self.logger.warning(f"⚠️ Lighter order placement failed, retrying ({i+1}/{max_retries})...")
+                    await asyncio.sleep(1)
+                
+                if not tx_hash:
+                    self.logger.error("❌ CRITICAL: Failed to place Lighter hedge order after retries! Position is unhedged.")
+                    self.logger.warning("⚠️ Attempting EMERGENCY CLOSE of Maker position...")
+                    try:
+                        # We bought on Maker, so we need to Sell to close.
+                        # Use aggressive price (e.g. 5% lower) to ensure fill as Taker
+                        current_price = self.order_manager.current_lighter_price # This is lighter price, not maker
+                        # Fetch current maker bid
+                        bbo = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
+                        exit_price = bbo[0] * Decimal('0.95') # Sell into bid with slippage tolerance
+                        
+                        await self.maker_client.place_close_order(
+                            contract_id=self.maker_contract_id,
+                            quantity=self.order_quantity,
+                            price=exit_price,
+                            side='sell',
+                            post_only=False
+                        )
+                        self.logger.info("✅ Emergency close order placed.")
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to execute emergency close: {e}")
+                
                 break
 
             await asyncio.sleep(0.01)
@@ -663,6 +787,18 @@ class GenericArb:
                 f"❌ Position diff is too large: {self.position_tracker.get_net_position()}")
             sys.exit(1)
 
+        # Validate Lighter conditions (Liquidity & Balance)
+        # For Short Trade: Sell Maker, Buy Lighter
+        # We need to check if we can BUY on Lighter (Asks)
+        _, best_ask = self.order_book_manager.get_lighter_best_levels()
+        if not best_ask:
+            self.logger.warning("⚠️ Lighter order book empty, skipping trade")
+            return
+
+        limit_price = best_ask[0] * Decimal('1.005') # Allow 0.5% slippage for validation
+        if not await self._validate_trade_conditions('buy', self.order_quantity, limit_price):
+            return
+
         self.order_manager.order_execution_complete = False
         self.order_manager.waiting_for_lighter_fill = False
 
@@ -680,12 +816,40 @@ class GenericArb:
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
             if self.order_manager.waiting_for_lighter_fill:
-                await self.order_manager.place_lighter_market_order(
-                    self.order_manager.current_lighter_side,
-                    self.order_manager.current_lighter_quantity,
-                    self.order_manager.current_lighter_price,
-                    self.stop_flag
-                )
+                # Retry logic for Lighter order
+                max_retries = 5
+                for i in range(max_retries):
+                    tx_hash = await self.order_manager.place_lighter_market_order(
+                        self.order_manager.current_lighter_side,
+                        self.order_manager.current_lighter_quantity,
+                        self.order_manager.current_lighter_price,
+                        self.stop_flag
+                    )
+                    if tx_hash:
+                        break
+                    self.logger.warning(f"⚠️ Lighter order placement failed, retrying ({i+1}/{max_retries})...")
+                    await asyncio.sleep(1)
+                
+                if not tx_hash:
+                    self.logger.error("❌ CRITICAL: Failed to place Lighter hedge order after retries! Position is unhedged.")
+                    self.logger.warning("⚠️ Attempting EMERGENCY CLOSE of Maker position...")
+                    try:
+                        # We sold on Maker, so we need to Buy to close.
+                        # Use aggressive price (e.g. 5% higher) to ensure fill as Taker
+                        bbo = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
+                        exit_price = bbo[1] * Decimal('1.05') # Buy from ask with slippage tolerance
+                        
+                        await self.maker_client.place_close_order(
+                            contract_id=self.maker_contract_id,
+                            quantity=self.order_quantity,
+                            price=exit_price,
+                            side='buy',
+                            post_only=False
+                        )
+                        self.logger.info("✅ Emergency close order placed.")
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to execute emergency close: {e}")
+                
                 break
 
             await asyncio.sleep(0.01)

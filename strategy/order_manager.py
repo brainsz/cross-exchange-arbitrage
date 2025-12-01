@@ -88,32 +88,9 @@ class OrderManager:
 
     async def place_bbo_order(self, side: str, quantity: Decimal) -> str:
         """Place a BBO order on Maker exchange."""
-        best_bid, best_ask = await self.fetch_maker_bbo_prices()
+        # Note: Price calculation is handled by the exchange client's place_open_order method
+        # to ensure it uses the freshest BBO data.
 
-        # Determine price based on side (Maker strategy: Post-Only)
-        # Buy: Place at Best Ask - Tick (to be top of book or join bid? Strategy says:
-        # "Buy EdgeX @ Bid" in comments usually means joining the bid.
-        # But previous code was: 
-        # Buy: best_ask - tick (Trying to cross spread? No, post only would fail)
-        # Let's look at previous logic:
-        # if buy: price = best_ask - tick. 
-        # If spread is 1 tick, best_ask - tick = best_bid. So joining bid.
-        # If spread > 1 tick, best_ask - tick > best_bid. Improving bid.
-        
-        if side.lower() == 'buy':
-            # Try to be competitive but passive
-            if best_ask > 0:
-                order_price = best_ask - self.maker_tick_size
-            else:
-                 # Fallback if no ask, maybe use last price or bid + tick?
-                 # For safety, if no ask, we can't determine ceiling.
-                 # But let's assume valid BBO.
-                 order_price = best_bid # Just join bid if no ask?
-        else:
-            if best_bid > 0:
-                order_price = best_bid + self.maker_tick_size
-            else:
-                order_price = best_ask
 
         self.maker_client_order_id = str(int(time.time() * 1000))
         
@@ -142,10 +119,12 @@ class OrderManager:
             raise Exception("Maker client not initialized")
 
         self.maker_order_status = None
+        self.current_maker_order_id = None  # Reset order ID
         self.logger.info(f"[OPEN] [Maker] [{side}] Placing Maker POST-ONLY order")
         
         try:
             order_id = await self.place_bbo_order(side, quantity)
+            self.current_maker_order_id = order_id  # Store current order ID
         except Exception as e:
             self.logger.error(f"❌ Error placing Maker order: {e}")
             return False
@@ -156,32 +135,68 @@ class OrderManager:
             # In generic arb, we rely on WS updates calling handle_maker_order_update
             # OR we need to poll if no WS.
             
-            # If status is not updated via WS, we should poll.
-            if self.maker_order_status is None:
+            # Poll status if not final
+            if self.maker_order_status not in ['FILLED', 'CANCELED', 'EXPIRED']:
                  # Poll status
-                 order_info = await self.maker_client.get_order_info(order_id)
-                 if order_info:
-                     self.update_maker_order_status(order_info.status)
-                     if order_info.status == 'FILLED':
-                         # Manually trigger update handler if polling found it filled
-                         self.handle_maker_order_update({
-                             'side': order_info.side,
-                             'filled_size': order_info.filled_size,
-                             'price': order_info.price,
-                             'status': order_info.status
-                         })
+                 try:
+                     order_info = await self.maker_client.get_order_info(order_id)
+                     if order_info:
+                         self.update_maker_order_status(order_info.status)
+                         if order_info.status == 'FILLED':
+                             # Manually trigger update handler if polling found it filled
+                             self.handle_maker_order_update({
+                                 'order_id': order_id,
+                                 'side': order_info.side,
+                                 'filled_size': order_info.filled_size,
+                                 'price': order_info.price,
+                                 'status': order_info.status
+                             })
+                 except Exception as e:
+                     self.logger.warning(f"⚠️ Error polling order status: {e}")
 
             if self.maker_order_status == 'CANCELED':
+                self.logger.info(f"ℹ️  Maker order {order_id} was canceled.")
                 return False
             elif self.maker_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED', None]:
                 await asyncio.sleep(0.5)
+                # If order is not filled within 5 seconds, cancel it and retry loop
                 if time.time() - start_time > 5:
+                    self.logger.info(f"⏱️  Maker order {order_id} timed out (5s), canceling...")
                     try:
                         cancel_result = await self.maker_client.cancel_order(order_id)
                         if not cancel_result.success:
                             self.logger.error(f"❌ Error canceling Maker order: {cancel_result.error_message}")
+                        
+                        # Wait a bit for cancellation to process
+                        await asyncio.sleep(1)
+                        
+                        # Check if it was filled during cancellation or partially filled before
+                        try:
+                            order_info = await self.maker_client.get_order_info(order_id)
+                            if order_info and order_info.filled_size > 0:
+                                self.logger.info(f"ℹ️  Maker order {order_id} was filled/partially filled ({order_info.filled_size}) before cancel.")
+                                self.handle_maker_order_update({
+                                     'order_id': order_id,
+                                     'side': order_info.side,
+                                     'filled_size': order_info.filled_size,
+                                     'price': order_info.price,
+                                     'status': 'FILLED' # Treat as filled for hedging
+                                })
+                                return True
+                        except Exception as e:
+                            self.logger.error(f"⚠️ Error checking order info after cancel: {e}")
+
+
+                        # Check if WebSocket triggered a hedge while we were canceling
+                        if self.waiting_for_lighter_fill:
+                            self.logger.info(f"ℹ️  Order {order_id} filled during cancel, proceeding with hedge")
+                            return True
+                        
+                        # Break the loop to return False, so the main loop can decide to retry
+                        return False
                     except Exception as e:
                         self.logger.error(f"❌ Error canceling Maker order: {e}")
+                        return False
             elif self.maker_order_status == 'FILLED':
                 break
             else:
@@ -194,10 +209,16 @@ class OrderManager:
 
     def handle_maker_order_update(self, order_data: dict):
         """Handle Maker order update."""
+        order_id = order_data.get('order_id')
         side = order_data.get('side', '').lower()
         filled_size = order_data.get('filled_size')
         price = order_data.get('price', '0')
         status = order_data.get('status')
+        
+        # Only process if this is our current order
+        if order_id and self.current_maker_order_id and str(order_id) != str(self.current_maker_order_id):
+            self.logger.info(f"ℹ️  Ignoring order update for {order_id} (current order: {self.current_maker_order_id})")
+            return
         
         self.update_maker_order_status(status)
 

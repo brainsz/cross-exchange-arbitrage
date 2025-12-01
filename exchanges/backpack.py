@@ -1,21 +1,182 @@
 """
-Backpack exchange client implementation using bpx-py.
+Backpack exchange client implementation with WebSocket support.
 """
 
 import os
 import asyncio
+import json
+import time
+import base64
 import traceback
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
+from cryptography.hazmat.primitives.asymmetric import ed25519
+import websockets
 from bpx.account import Account
 from bpx.public import Public
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
 
+# Monkeypatch requests to ensure timeout
+import requests.adapters
+def _timeout_request_patch(func):
+    def wrapper(*args, **kwargs):
+        if 'timeout' not in kwargs or kwargs['timeout'] is None:
+            kwargs['timeout'] = 10
+        return func(*args, **kwargs)
+    return wrapper
+
+requests.adapters.HTTPAdapter.send = _timeout_request_patch(requests.adapters.HTTPAdapter.send)
+
+
+class BackpackWebSocketManager:
+    """WebSocket manager for Backpack order updates."""
+
+    def __init__(self, api_key: str, api_secret: str, symbol: str, order_update_callback):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.symbol = symbol
+        self.order_update_callback = order_update_callback
+        self.websocket = None
+        self.running = False
+        self.ws_url = "wss://ws.backpack.exchange"
+        self.logger = None
+
+        # Initialize ED25519 private key from base64 decoded secret
+        try:
+            self.private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+                base64.b64decode(api_secret)
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to decode API secret as ED25519 key: {e}")
+
+    def _generate_signature(self, instruction: str, timestamp: int, window: int = 5000) -> str:
+        """Generate ED25519 signature for WebSocket authentication."""
+        # Create the message string in the same format as BPX package
+        message = f"instruction={instruction}&timestamp={timestamp}&window={window}"
+
+        # Sign the message using ED25519 private key
+        signature_bytes = self.private_key.sign(message.encode())
+
+        # Return base64 encoded signature
+        return base64.b64encode(signature_bytes).decode()
+
+    async def connect(self):
+        """Connect to Backpack WebSocket."""
+        while self.running:
+            try:
+                if self.logger:
+                    self.logger.log("Connecting to Backpack WebSocket", "INFO")
+                self.websocket = await websockets.connect(self.ws_url)
+
+                # Subscribe to order updates for the specific symbol
+                timestamp = int(time.time() * 1000)
+                signature = self._generate_signature("subscribe", timestamp)
+
+                subscribe_message = {
+                    "method": "SUBSCRIBE",
+                    "params": [f"account.orderUpdate.{self.symbol}"],
+                    "signature": [
+                        self.api_key,
+                        signature,
+                        str(timestamp),
+                        "5000"
+                    ]
+                }
+
+                await self.websocket.send(json.dumps(subscribe_message))
+                if self.logger:
+                    self.logger.log(f"✅ Subscribed to Backpack order updates for {self.symbol}", "INFO")
+
+                # Start listening for messages
+                await self._listen()
+
+            except websockets.exceptions.ConnectionClosed:
+                if self.logger:
+                    self.logger.log("Backpack WebSocket connection closed, reconnecting...", "WARNING")
+                await asyncio.sleep(2)
+            except Exception as e:
+                if self.logger:
+                    self.logger.log(f"Backpack WebSocket error: {e}", "ERROR")
+                await asyncio.sleep(2)
+
+    async def _listen(self):
+        """Listen for WebSocket messages."""
+        try:
+            async for message in self.websocket:
+                if not self.running:
+                    break
+
+                try:
+                    data = json.loads(message)
+                    await self._handle_message(data)
+                except json.JSONDecodeError as e:
+                    if self.logger:
+                        self.logger.log(f"Failed to parse WebSocket message: {e}", "ERROR")
+                except Exception as e:
+                    if self.logger:
+                        self.logger.log(f"Error handling WebSocket message: {e}", "ERROR")
+                        self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+
+        except websockets.exceptions.ConnectionClosed:
+            if self.logger:
+                self.logger.log("Backpack WebSocket connection closed", "WARNING")
+        except Exception as e:
+            if self.logger:
+                self.logger.log(f"Backpack WebSocket listen error: {e}", "ERROR")
+
+    async def _handle_message(self, data: Dict[str, Any]):
+        """Handle incoming WebSocket messages."""
+        try:
+            stream = data.get('stream', '')
+            payload = data.get('data', {})
+
+            if 'orderUpdate' in stream:
+                await self._handle_order_update(payload)
+            elif data.get('method') == 'SUBSCRIBE':
+                # Subscription confirmation
+                if self.logger:
+                    self.logger.log(f"Subscription confirmed: {data}", "DEBUG")
+            else:
+                if self.logger:
+                    self.logger.log(f"Unknown WebSocket message: {data}", "DEBUG")
+
+        except Exception as e:
+            if self.logger:
+                self.logger.log(f"Error handling WebSocket message: {e}", "ERROR")
+
+    async def _handle_order_update(self, order_data: Dict[str, Any]):
+        """Handle order update messages."""
+        try:
+            # Call the order update callback if it exists
+            if self.order_update_callback:
+                await self.order_update_callback(order_data)
+        except Exception as e:
+            if self.logger:
+                self.logger.log(f"Error in order update callback: {e}", "ERROR")
+                self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+
+    async def start(self):
+        """Start the WebSocket connection."""
+        self.running = True
+        asyncio.create_task(self.connect())
+
+    async def disconnect(self):
+        """Disconnect from WebSocket."""
+        self.running = False
+        if self.websocket:
+            await self.websocket.close()
+            if self.logger:
+                self.logger.log("Backpack WebSocket disconnected", "INFO")
+
+    def set_logger(self, logger):
+        """Set the logger instance."""
+        self.logger = logger
+
 
 class BackpackClient(BaseExchangeClient):
-    """Backpack exchange client implementation."""
+    """Backpack exchange client implementation with WebSocket support."""
 
     def __init__(self, config: Dict[str, Any]):
         """Initialize Backpack client."""
@@ -36,12 +197,7 @@ class BackpackClient(BaseExchangeClient):
         self.logger = TradingLogger(exchange="backpack", ticker=self.config.ticker, log_to_console=False)
 
         self._order_update_handler = None
-        
-        # WebSocket management is handled differently in bpx-py (it might not expose a direct WS manager like EdgeX SDK)
-        # We might need to implement a custom WS wrapper or use what bpx-py provides if it supports async WS.
-        # Checking bpx-py documentation/source would be ideal, but assuming standard REST for now for critical ops
-        # and we will check if bpx-py has WS support. 
-        # Note: bpx-py seems to be synchronous for REST. We might need to wrap in asyncio.to_thread for async compatibility.
+        self.ws_manager = None
         
     def _validate_config(self) -> None:
         """Validate Backpack configuration."""
@@ -52,11 +208,12 @@ class BackpackClient(BaseExchangeClient):
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size."""
-        # For Backpack, the contract_id is the symbol itself, e.g. "SOL_USDC"
-        # We need to fetch tick size from public API
         try:
             # Run in thread as bpx-py is sync
-            markets = await asyncio.to_thread(self.public.get_markets)
+            markets = await asyncio.wait_for(
+                asyncio.to_thread(self.public.get_markets),
+                timeout=10
+            )
             
             if isinstance(markets, dict) and 'code' in markets:
                 raise Exception(f"Backpack API Error: {markets.get('code')} - {markets.get('message')}")
@@ -81,44 +238,117 @@ class BackpackClient(BaseExchangeClient):
             raise
 
     async def connect(self) -> None:
-        """Connect to the exchange."""
-        # bpx-py REST client doesn't need explicit connection.
-        # If we implement WS later, we'll add it here.
-        self.logger.log("Backpack client initialized", "INFO")
+        """Connect to Backpack WebSocket."""
+        # Initialize WebSocket manager
+        self.ws_manager = BackpackWebSocketManager(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            symbol=self.config.contract_id,
+            order_update_callback=self._handle_websocket_order_update
+        )
+        self.ws_manager.set_logger(self.logger)
+
+        try:
+            # Start WebSocket connection
+            await self.ws_manager.start()
+            # Wait a moment for connection to establish
+            await asyncio.sleep(2)
+        except Exception as e:
+            self.logger.log(f"Error connecting to Backpack WebSocket: {e}", "ERROR")
+            raise
 
     async def disconnect(self) -> None:
-        """Disconnect from the exchange."""
-        pass
-
-    def get_exchange_name(self) -> str:
-        return "backpack"
+        """Disconnect from Backpack."""
+        try:
+            if self.ws_manager:
+                await self.ws_manager.disconnect()
+        except Exception as e:
+            self.logger.log(f"Error during Backpack disconnect: {e}", "ERROR")
 
     def setup_order_update_handler(self, handler) -> None:
-        """Setup order update handler."""
-        # TODO: Implement WebSocket support for real-time updates
+        """Setup order update handler for WebSocket."""
         self._order_update_handler = handler
+
+    def get_exchange_name(self) -> str:
+        """Get the exchange name."""
+        return "backpack"
+
+    async def _handle_websocket_order_update(self, order_data: Dict[str, Any]):
+        """Handle order updates from WebSocket."""
+        try:
+            # Backpack WebSocket order update format
+            event_type = order_data.get('e', '')
+            order_id = order_data.get('i', '')
+            symbol = order_data.get('s', '')
+            side = order_data.get('S', '')
+            quantity = order_data.get('q', '0')
+            price = order_data.get('p', '0')
+            fill_quantity = order_data.get('z', '0')
+            status = order_data.get('X', '')
+
+            # Only process orders for our symbol
+            if symbol != self.config.contract_id:
+                return
+
+            # Determine order side
+            if side.upper() == 'BID':
+                order_side = 'buy'
+            elif side.upper() == 'ASK':
+                order_side = 'sell'
+            else:
+                self.logger.log(f"Unexpected order side: {side}", "WARNING")
+                return
+
+            # Map Backpack status to our status
+            mapped_status = 'UNKNOWN'
+            if status == 'FILLED' or (event_type == 'orderFill' and quantity == fill_quantity):
+                mapped_status = 'FILLED'
+            elif status == 'NEW' or event_type == 'orderAccepted':
+                mapped_status = 'OPEN'
+            elif status == 'PARTIALLY_FILLED' or event_type == 'orderFill':
+                mapped_status = 'PARTIALLY_FILLED'
+            elif status == 'CANCELED' or event_type in ['orderCancelled', 'orderExpired']:
+                mapped_status = 'CANCELED'
+
+            # Call the order update handler
+            if self._order_update_handler and mapped_status in ['FILLED', 'PARTIALLY_FILLED']:
+                # Check if handler is async
+                import asyncio
+                import inspect
+                
+                order_update = {
+                    'order_id': order_id,
+                    'side': order_side,
+                    'status': mapped_status,
+                    'size': Decimal(quantity),
+                    'price': Decimal(price),
+                    'contract_id': symbol,
+                    'filled_size': Decimal(fill_quantity)
+                }
+                
+                if inspect.iscoroutinefunction(self._order_update_handler):
+                    await self._order_update_handler(order_update)
+                else:
+                    self._order_update_handler(order_update)
+
+        except Exception as e:
+            self.logger.log(f"Error handling WebSocket order update: {e}", "ERROR")
+            self.logger.log(f"Order data: {order_data}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
     @query_retry(default_return=(Decimal('0'), Decimal('0')))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        """Fetch Best Bid and Offer prices."""
-        # contract_id in Backpack is the symbol, e.g., "SOL_USDC"
+        """Fetch best bid/offer prices."""
         try:
-            # Run synchronous call in thread
-            depth = await asyncio.to_thread(self.public.get_depth, contract_id)
+            # Run in thread as bpx-py is sync
+            depth = await asyncio.wait_for(
+                asyncio.to_thread(self.public.get_depth, contract_id),
+                timeout=5
+            )
             
             bids = depth.get('bids', [])
             asks = depth.get('asks', [])
             
-            best_bid = Decimal(bids[-1][0]) if bids else Decimal('0') # Bids are sorted ascending? usually descending. 
-            # bpx-py returns bids sorted? Let's assume standard order book response:
-            # bids: [[price, size], ...] usually high to low
-            # asks: [[price, size], ...] usually low to high
-            # Need to verify bpx-py return format. 
-            # Assuming bids[0] is best bid if sorted high-to-low.
-            # Actually, let's check standard API behavior.
-            
-            # Re-checking bpx-py or standard Backpack API:
-            # Bids are usually sorted high to low. Asks low to high.
             best_bid = Decimal(bids[0][0]) if bids else Decimal('0')
             best_ask = Decimal(asks[0][0]) if asks else Decimal('0')
             
@@ -128,143 +358,312 @@ class BackpackClient(BaseExchangeClient):
             return Decimal('0'), Decimal('0')
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
-        """Place an open order."""
+        """Place an open order (post-only limit order)."""
         try:
-            side = 'Bid' if direction.lower() == 'buy' else 'Ask'
-            
-            # Get current price to place maker order
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-            if best_bid == 0 or best_ask == 0:
-                return OrderResult(success=False, error_message="Invalid BBO")
+            
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
-            if direction.lower() == 'buy':
-                price = best_ask - self.config.tick_size
+            if direction == 'buy':
+                order_price = best_ask - self.config.tick_size
+                side = 'Bid'
             else:
-                price = best_bid + self.config.tick_size
-                
-            price = self.round_to_tick(price)
-            
-            # Execute order
-            result = await asyncio.to_thread(
-                self.account.execute_order,
-                symbol=contract_id,
-                side=side,
-                order_type='Limit',
-                quantity=str(quantity),
-                price=str(price),
-                post_only=True
-            )
-            
-            return OrderResult(
-                success=True,
-                order_id=result.get('id'),
-                side=direction,
-                size=quantity,
-                price=price,
-                status='OPEN' # Optimistic status
-            )
-        except Exception as e:
-            return OrderResult(success=False, error_message=str(e))
+                order_price = best_bid + self.config.tick_size
+                side = 'Ask'
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order."""
-        try:
-            bp_side = 'Bid' if side.lower() == 'buy' else 'Ask'
-            
-            # Execute order
-            result = await asyncio.to_thread(
-                self.account.execute_order,
-                symbol=contract_id,
-                side=bp_side,
-                order_type='Limit',
-                quantity=str(quantity),
-                price=str(price),
-                post_only=True
+            order_price = self.round_to_tick(order_price)
+
+            # Place order using bpx-py
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.execute_order,
+                    symbol=contract_id,
+                    side=side,
+                    order_type='Limit',
+                    quantity=str(quantity),
+                    price=str(order_price),
+                    post_only=True,
+                    time_in_force='GTC'
+                ),
+                timeout=10
             )
-            
-            return OrderResult(
-                success=True,
-                order_id=result.get('id'),
-                side=side,
-                size=quantity,
-                price=price,
-                status='OPEN'
-            )
+
+            self.logger.log(f"Place order result: {result}", "INFO")
+
+            if isinstance(result, dict) and 'id' in result:
+                order_id = str(result['id'])
+                self.logger.log(f"Extracted order_id: {order_id}", "DEBUG")
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=direction,
+                    size=quantity,
+                    price=order_price,
+                    status='NEW'
+                )
+            else:
+                return OrderResult(success=False, error_message=f'Unexpected response: {result}')
+
         except Exception as e:
+            self.logger.log(f"Error placing order: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return OrderResult(success=False, error_message=str(e))
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order."""
         try:
-            # Backpack API requires symbol to cancel? bpx-py cancel_order takes symbol and order_id
-            # We need to store symbol/contract_id in config or pass it.
-            await asyncio.to_thread(
-                self.account.cancel_order,
-                symbol=self.config.contract_id,
-                order_id=order_id
+            self.logger.log(f"Attempting to cancel order {order_id}", "INFO")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.cancel_order,
+                    symbol=self.config.contract_id,
+                    order_id=order_id
+                ),
+                timeout=10
             )
-            return OrderResult(success=True)
+
+            if result and 'id' in result:
+                self.logger.log(f"Successfully canceled order {order_id}", "INFO")
+                return OrderResult(success=True)
+            else:
+                return OrderResult(success=False, error_message=f'Cancel failed: {result}')
+
         except Exception as e:
+            self.logger.log(f"Error canceling order: {e}", "ERROR")
             return OrderResult(success=False, error_message=str(e))
 
+    @query_retry()
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
-        """Get order info."""
+        """Get order information. Returns None if order not found (to allow retries)."""
         try:
-            # bpx-py might not have direct get_order. It has get_open_orders and get_history.
-            # Let's try to find it in open orders first.
-            orders = await asyncio.to_thread(
-                self.account.get_open_orders,
-                symbol=self.config.contract_id
+            # First check open orders
+            open_order = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.get_open_order,
+                    symbol=self.config.contract_id,
+                    order_id=order_id
+                ),
+                timeout=5
             )
-            
+
+            if open_order and isinstance(open_order, dict) and 'id' in open_order:
+                status = open_order.get('status', 'UNKNOWN')
+                if status == 'New':
+                    status = 'OPEN'
+                elif status == 'Filled':
+                    status = 'FILLED'
+                elif status == 'PartiallyFilled':
+                    status = 'PARTIALLY_FILLED'
+                elif status in ['Canceled', 'Expired']:
+                    status = 'CANCELED'
+
+                return OrderInfo(
+                    order_id=str(open_order.get('id')),
+                    side=open_order.get('side', '').lower(),
+                    size=Decimal(open_order.get('quantity', 0)),
+                    price=Decimal(open_order.get('price', 0)),
+                    status=status,
+                    filled_size=Decimal(open_order.get('executedQuantity', 0))
+                )
+
+            # If not in open orders, check order history
+            try:
+                orders = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.account.get_order_history,
+                        symbol=self.config.contract_id,
+                        limit=100
+                    ),
+                    timeout=5
+                )
+            except AttributeError:
+                # Fallback to get_fill_history if order history is also missing or different
+                self.logger.log(f"AttributeError: Account object missing get_order_history. Available: {dir(self.account)}", "ERROR")
+                # Try get_fill_history as fallback
+                try:
+                     fills = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.account.get_fill_history,
+                            symbol=self.config.contract_id,
+                            limit=100
+                        ),
+                        timeout=5
+                    )
+                     # Construct order info from fills
+                     filled_amount = Decimal('0')
+                     found_fill = False
+                     last_price = Decimal('0')
+                     side = ''
+                     for fill in fills:
+                        fill_order_id = fill.get('orderId') or fill.get('order_id')
+                        if str(fill_order_id) == str(order_id):
+                            found_fill = True
+                            filled_amount += Decimal(fill.get('quantity', 0))
+                            last_price = Decimal(fill.get('price', 0))
+                            side = fill.get('side', '').lower()
+                     
+                     if found_fill:
+                        return OrderInfo(
+                            order_id=order_id,
+                            side=side,
+                            size=filled_amount,
+                            price=last_price,
+                            status='FILLED',
+                            filled_size=filled_amount
+                        )
+                     return None
+
+                except Exception as e:
+                     self.logger.log(f"Error in fallback get_fill_history: {e}", "ERROR")
+                     raise
+
             for o in orders:
-                if o.get('id') == order_id:
+                # Ensure we compare strings to avoid int/str mismatch
+                history_order_id = str(o.get('id'))
+                target_order_id = str(order_id)
+                
+                if history_order_id == target_order_id:
+                    status = o.get('status', 'UNKNOWN')
+                    # Map Backpack status to our status
+                    if status == 'Filled':
+                        status = 'FILLED'
+                    elif status == 'New':
+                        status = 'OPEN'
+                    elif status == 'PartiallyFilled':
+                        status = 'PARTIALLY_FILLED'
+                    elif status == 'Canceled':
+                        status = 'CANCELED'
+                    elif status == 'Expired':
+                        status = 'CANCELED'
+                        
                     return OrderInfo(
-                        order_id=o.get('id'),
+                        order_id=history_order_id,
                         side=o.get('side').lower(),
                         size=Decimal(o.get('quantity')),
                         price=Decimal(o.get('price')),
-                        status='OPEN', # If in open orders, it's open
+                        status=status,
                         filled_size=Decimal(o.get('executedQuantity', 0))
                     )
-            return None
-        except Exception:
+            
+            # Debug logging if not found
+            self.logger.log(f"Order {order_id} not found in history. History IDs: {[o.get('id') for o in orders[:5]]}...", "WARNING")
+            
+            # If not found in history either, return None to indicate "unknown/pending" 
+            # so the OrderManager keeps polling until timeout.
             return None
 
-    async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
-        """Get active orders."""
+            return None
+        except Exception as e:
+            self.logger.log(f"Error getting order info: {e}", "ERROR")
+            raise
+
+    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str, post_only: bool = True) -> OrderResult:
+        """Place a close order (limit order to close position)."""
         try:
-            orders = await asyncio.to_thread(
-                self.account.get_open_orders,
-                symbol=contract_id
+            # Determine Backpack side
+            if side.lower() == 'buy':
+                backpack_side = 'Bid'
+            elif side.lower() == 'sell':
+                backpack_side = 'Ask'
+            else:
+                return OrderResult(success=False, error_message=f'Invalid side: {side}')
+
+            order_price = self.round_to_tick(price)
+
+            # Place order using bpx-py
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.execute_order,
+                    symbol=contract_id,
+                    side=backpack_side,
+                    order_type='Limit',
+                    quantity=str(quantity),
+                    price=str(order_price),
+                    post_only=post_only,
+                    time_in_force='GTC'
+                ),
+                timeout=10
             )
-            
+
+            if isinstance(result, dict) and 'id' in result:
+                order_id = str(result['id'])
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=side,
+                    size=quantity,
+                    price=order_price,
+                    status='NEW'
+                )
+            else:
+                return OrderResult(success=False, error_message=f'Unexpected response: {result}')
+
+        except Exception as e:
+            self.logger.log(f"Error placing close order: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
+    @query_retry(default_return=[])
+    async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
+        """Get active orders for a contract."""
+        try:
+            orders = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.get_open_orders,
+                    symbol=contract_id
+                ),
+                timeout=10
+            )
+
+            if not orders:
+                return []
+
             result = []
-            for o in orders:
-                result.append(OrderInfo(
-                    order_id=o.get('id'),
-                    side=o.get('side').lower(),
-                    size=Decimal(o.get('quantity')),
-                    price=Decimal(o.get('price')),
-                    status='OPEN',
-                    filled_size=Decimal(o.get('executedQuantity', 0))
-                ))
+            for order in orders:
+                if isinstance(order, dict):
+                    side = 'buy' if order.get('side') == 'Bid' else 'sell'
+                    status = order.get('status', 'UNKNOWN')
+                    if status == 'New':
+                        status = 'OPEN'
+                    elif status == 'Filled':
+                        status = 'FILLED'
+                    elif status == 'PartiallyFilled':
+                        status = 'PARTIALLY_FILLED'
+
+                    result.append(OrderInfo(
+                        order_id=str(order.get('id')),
+                        side=side,
+                        size=Decimal(order.get('quantity', 0)),
+                        price=Decimal(order.get('price', 0)),
+                        status=status,
+                        filled_size=Decimal(order.get('executedQuantity', 0))
+                    ))
+
             return result
+
         except Exception as e:
             self.logger.log(f"Error getting active orders: {e}", "ERROR")
             return []
 
+    @query_retry(default_return=Decimal('0'))
     async def get_account_positions(self) -> Decimal:
-        """Get account positions (balances for Spot)."""
+        """Get account positions."""
         try:
-            balances = await asyncio.to_thread(self.account.get_balances)
-            # For spot, "position" is the balance of the base asset
-            # contract_id is like "SOL_USDC", we need "SOL"
-            base_asset = self.config.contract_id.split('_')[0]
+            balances = await asyncio.wait_for(
+                asyncio.to_thread(self.account.get_balances),
+                timeout=10
+            )
             
-            if base_asset in balances:
-                return Decimal(balances[base_asset].get('available', 0))
+            if not balances:
+                return Decimal('0')
+            
+            # get_balances returns a list of balance objects
+            if isinstance(balances, list):
+                for balance in balances:
+                    if isinstance(balance, dict) and balance.get('symbol') == self.config.contract_id:
+                        return Decimal(balance.get('available', '0'))
+            
             return Decimal('0')
         except Exception as e:
-            self.logger.log(f"Error getting positions: {e}", "ERROR")
+            self.logger.log(f"Error getting positions: {e}", "WARNING")
             return Decimal('0')
