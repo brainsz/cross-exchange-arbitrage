@@ -24,21 +24,17 @@ class PositionTracker:
         self.lighter_position = Decimal('0')
 
     async def get_edgex_position(self) -> Decimal:
-        """Get EdgeX position."""
+        """Get EdgeX/Backpack position."""
         if not self.edgex_client:
             raise Exception("EdgeX client not initialized")
 
-        positions_data = await self.edgex_client.get_account_positions()
-        if not positions_data or 'data' not in positions_data:
-            self.logger.warning("No positions or failed to get positions")
+        try:
+            position = await self.edgex_client.get_account_positions()
+            # get_account_positions now returns Decimal directly (matching EdgeX/Lighter)
+            return position if position else Decimal('0')
+        except Exception as e:
+            self.logger.warning(f"Error getting positions: {e}")
             return Decimal('0')
-
-        positions = positions_data.get('data', {}).get('positionList', [])
-        if positions:
-            for p in positions:
-                if isinstance(p, dict) and p.get('contractId') == self.edgex_contract_id:
-                    return Decimal(p.get('openSize', 0))
-        return Decimal('0')
 
     async def get_lighter_position(self) -> Decimal:
         """Get Lighter position."""

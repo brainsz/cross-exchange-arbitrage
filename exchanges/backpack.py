@@ -199,6 +199,9 @@ class BackpackClient(BaseExchangeClient):
         self._order_update_handler = None
         self.ws_manager = None
         
+        # Track processed filled orders to prevent duplicates
+        self._processed_fills = set()
+        
     def _validate_config(self) -> None:
         """Validate Backpack configuration."""
         required_env_vars = ['BACKPACK_API_KEY', 'BACKPACK_API_SECRET']
@@ -311,6 +314,17 @@ class BackpackClient(BaseExchangeClient):
                 mapped_status = 'CANCELED'
 
             # Call the order update handler
+            # Deduplicate FILLED events (Backpack may send multiple)
+            if mapped_status == 'FILLED':
+                if order_id in self._processed_fills:
+                    self.logger.log(f"Ignoring duplicate FILLED event for order {order_id}", "DEBUG")
+                    return
+                self._processed_fills.add(order_id)
+                # Limit set size to prevent memory growth
+                if len(self._processed_fills) > 1000:
+                    # Remove oldest half
+                    self._processed_fills = set(list(self._processed_fills)[-500:])
+            
             if self._order_update_handler and mapped_status in ['FILLED', 'PARTIALLY_FILLED']:
                 # Check if handler is async
                 import asyncio
@@ -365,11 +379,17 @@ class BackpackClient(BaseExchangeClient):
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
+            # Use mid-price strategy for POST-ONLY orders
+            # This keeps price close to market while still being passive
+            mid_price = (best_bid + best_ask) / Decimal('2')
+            
             if direction == 'buy':
-                order_price = best_ask - self.config.tick_size
+                # Buy order: slightly below mid-price
+                order_price = mid_price - self.config.tick_size
                 side = 'Bid'
             else:
-                order_price = best_bid + self.config.tick_size
+                # Sell order: slightly above mid-price
+                order_price = mid_price + self.config.tick_size
                 side = 'Ask'
 
             order_price = self.round_to_tick(order_price)
@@ -409,6 +429,64 @@ class BackpackClient(BaseExchangeClient):
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return OrderResult(success=False, error_message=str(e))
+
+    async def place_taker_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+        """Place a taker order (immediate execution).
+        
+        Uses aggressive pricing for immediate execution.
+        Taker fee: 0.024%
+        """
+        try:
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # Aggressive pricing for immediate execution
+            if direction == 'buy':
+                order_price = best_ask  # Buy at ask (taker)
+                side = 'Bid'
+            else:
+                order_price = best_bid  # Sell at bid (taker)
+                side = 'Ask'
+
+            order_price = self.round_to_tick(order_price)
+
+            # Place order without post_only (allows taker)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.account.execute_order,
+                    symbol=contract_id,
+                    side=side,
+                    order_type='Limit',
+                    quantity=str(quantity),
+                    price=str(order_price),
+                    post_only=False,
+                    time_in_force='IOC'
+                ),
+                timeout=10
+            )
+
+            self.logger.log(f"Place taker order result: {result}", "INFO")
+
+            if isinstance(result, dict) and 'id' in result:
+                order_id = str(result['id'])
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=direction,
+                    size=quantity,
+                    price=order_price,
+                    status='NEW'
+                )
+            else:
+                return OrderResult(success=False, error_message=f'Unexpected response: {result}')
+
+        except Exception as e:
+            self.logger.log(f"Error placing taker order: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order."""
@@ -647,23 +725,85 @@ class BackpackClient(BaseExchangeClient):
 
     @query_retry(default_return=Decimal('0'))
     async def get_account_positions(self) -> Decimal:
-        """Get account positions."""
+        """Get account positions for futures contracts.
+        
+        Returns the position size as Decimal (matching EdgeX/Lighter interface).
+        """
         try:
-            balances = await asyncio.wait_for(
-                asyncio.to_thread(self.account.get_balances),
-                timeout=10
+            import requests
+            import time
+            import base64
+            from urllib.parse import urlencode
+            
+            # Backpack positions endpoint
+            url = "https://api.backpack.exchange/api/v1/positions"
+            
+            # Generate signature for authentication
+            timestamp = int(time.time() * 1000)
+            window = 5000
+            instruction = "positionQuery"
+            
+            # Try with symbol parameter first
+            params = {'symbol': self.config.contract_id}
+            query_string = urlencode(params)
+            message = f"instruction={instruction}&{query_string}&timestamp={timestamp}&window={window}"
+            
+            # Sign with ED25519
+            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+                base64.b64decode(self.api_secret)
+            )
+            signature_bytes = private_key.sign(message.encode())
+            signature = base64.b64encode(signature_bytes).decode()
+            
+            # Set headers
+            headers = {
+                'X-API-Key': self.api_key,
+                'X-Signature': signature,
+                'X-Timestamp': str(timestamp),
+                'X-Window': str(window),
+                'Content-Type': 'application/json'
+            }
+            
+            # Make request
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    requests.get,
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=10
+                ),
+                timeout=15
             )
             
-            if not balances:
+            # Handle 404 - no positions found
+            if response.status_code == 404:
+                self.logger.log("No open positions found (404)", "DEBUG")
                 return Decimal('0')
             
-            # get_balances returns a list of balance objects
-            if isinstance(balances, list):
-                for balance in balances:
-                    if isinstance(balance, dict) and balance.get('symbol') == self.config.contract_id:
-                        return Decimal(balance.get('available', '0'))
-            
-            return Decimal('0')
+            if response.status_code == 200:
+                positions = response.json()
+                
+                # Extract position size
+                if isinstance(positions, list):
+                    if len(positions) > 0:
+                        # Find position for our symbol
+                        for pos in positions:
+                            if pos.get('symbol') == self.config.contract_id:
+                                # Return the net quantity (signed position size)
+                                net_qty = pos.get('netQuantity', '0')
+                                return Decimal(net_qty) if net_qty else Decimal('0')
+                    # No position found for this symbol
+                    return Decimal('0')
+                else:
+                    # Empty or unexpected response
+                    return Decimal('0')
+            else:
+                self.logger.log(f"Error getting positions: HTTP {response.status_code} - {response.text}", "WARNING")
+                return Decimal('0')
+                
         except Exception as e:
             self.logger.log(f"Error getting positions: {e}", "WARNING")
+            import traceback
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
             return Decimal('0')

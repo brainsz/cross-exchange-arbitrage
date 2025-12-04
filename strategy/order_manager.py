@@ -46,6 +46,14 @@ class OrderManager:
 
         # Callbacks
         self.on_order_filled: Optional[callable] = None
+        
+        # Fee configuration (default values)
+        self.maker_maker_fee = Decimal('0')  # Maker fee on maker exchange
+        self.maker_taker_fee = Decimal('0.00024')  # Taker fee on maker exchange
+        self.lighter_fee = Decimal('0.00005')  # Lighter fee
+        
+        # Current maker order ID tracking
+        self.current_maker_order_id: Optional[str] = None
 
     def set_maker_config(self, client: BaseExchangeClient, contract_id: str, tick_size: Decimal):
         """Set Maker client and configuration."""
@@ -65,6 +73,14 @@ class OrderManager:
     def set_callbacks(self, on_order_filled: callable = None):
         """Set callback functions."""
         self.on_order_filled = on_order_filled
+    
+    def set_fees(self, maker_maker_fee: Decimal = Decimal('0'), 
+                 maker_taker_fee: Decimal = Decimal('0.00024'),
+                 lighter_fee: Decimal = Decimal('0.00005')):
+        """Set fee configuration."""
+        self.maker_maker_fee = maker_maker_fee
+        self.maker_taker_fee = maker_taker_fee
+        self.lighter_fee = lighter_fee
 
     def round_to_tick(self, price: Decimal) -> Decimal:
         """Round price to tick size."""
@@ -112,6 +128,171 @@ class OrderManager:
             raise Exception(f"Failed to place order: {result.error_message}")
 
         return result.order_id
+
+    async def calculate_trade_profit(self, side: str, quantity: Decimal, use_maker: bool = True) -> Decimal:
+        """Calculate expected profit for a trade.
+        
+        Args:
+            side: 'buy' or 'sell' on maker exchange
+            quantity: Trade size
+            use_maker: If True, calculate for maker order. If False, for taker order.
+            
+        Returns:
+            Expected profit in USDC
+        """
+        try:
+            # Get current prices
+            maker_bid, maker_ask = await self.fetch_maker_bbo_prices()
+            lighter_bid, lighter_ask = self.order_book_manager.get_lighter_best_levels()
+            
+            if not lighter_bid or not lighter_ask:
+                return Decimal('-999999')  # Invalid
+            
+            lighter_bid_price = lighter_bid[0]
+            lighter_ask_price = lighter_ask[0]
+            
+            # Calculate execution prices matching actual order placement
+            maker_mid_price = (maker_bid + maker_ask) / Decimal('2')
+            
+            if side == 'buy':
+                # Buy on maker, sell on lighter
+                if use_maker:
+                    maker_price = maker_mid_price - self.maker_tick_size  # Maker: below mid
+                else:
+                    maker_price = maker_ask  # Taker: at ask
+                lighter_price = lighter_bid_price  # Sell at bid
+                
+                # Gross profit
+                gross_profit = (lighter_price - maker_price) * quantity
+            else:
+                # Sell on maker, buy on lighter
+                if use_maker:
+                    maker_price = maker_mid_price + self.maker_tick_size  # Maker: above mid
+                else:
+                    maker_price = maker_bid  # Taker: at bid
+                lighter_price = lighter_ask_price  # Buy at ask
+                
+                # Gross profit
+                gross_profit = (maker_price - lighter_price) * quantity
+            
+            # Calculate fees
+            maker_fee_rate = self.maker_maker_fee if use_maker else self.maker_taker_fee
+            maker_fee = maker_price * quantity * maker_fee_rate
+            lighter_fee = lighter_price * quantity * self.lighter_fee
+            
+            net_profit = gross_profit - maker_fee - lighter_fee
+            
+            return net_profit
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating profit: {e}")
+            return Decimal('-999999')
+
+    async def place_smart_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
+        """Place order with smart maker/taker selection based on profitability.
+        
+        Tries maker first (zero fees). If rejected or unprofitable, tries taker if profitable.
+        """
+        if not self.maker_client:
+            raise Exception("Maker client not initialized")
+        
+        # Calculate expected profits
+        maker_profit = await self.calculate_trade_profit(side, quantity, use_maker=True)
+        taker_profit = await self.calculate_trade_profit(side, quantity, use_maker=False)
+        
+        self.logger.info(f"💰 Profit estimate - Maker: {maker_profit:.4f} USDC, Taker: {taker_profit:.4f} USDC")
+        
+        # Allow small losses to increase trading volume
+        # User target: 10k USDC volume, max 1 USDC total loss
+        # Actual taker losses observed: -0.0005 to -0.0008 USDC per trade
+        # Assuming 50% maker (profitable) + 50% taker (small loss), total loss stays under 1 USDC
+        # Allow up to -0.001 USDC per trade to capture most opportunities
+        MIN_ACCEPTABLE_PROFIT = Decimal('-0.001')
+        
+        # Try maker first if acceptable (zero fees!)
+        if maker_profit > MIN_ACCEPTABLE_PROFIT:
+            self.logger.info(f"📊 Trying MAKER order (0% fee)")
+            success = await self.place_maker_post_only_order(side, quantity, stop_flag)
+            if success:
+                return True
+            self.logger.warning("⚠️ Maker order failed/rejected")
+        else:
+            self.logger.info(f"📊 Skipping MAKER order (too unprofitable: {maker_profit:.4f} USDC)")
+        
+        # Fallback to taker if acceptable
+        if taker_profit > MIN_ACCEPTABLE_PROFIT:
+            self.logger.info(f"📊 Trying TAKER order (0.024% fee, profit: {taker_profit:.4f} USDC)")
+            return await self.place_maker_taker_order(side, quantity, stop_flag)
+        else:
+            self.logger.info(f"❌ Skipping trade - both too unprofitable (taker: {taker_profit:.4f} USDC)")
+            return False
+
+    async def place_maker_taker_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
+        """Place a taker order on Maker exchange."""
+        if not self.maker_client:
+            raise Exception("Maker client not initialized")
+
+        self.maker_order_status = None
+        self.current_maker_order_id = None
+        self.logger.info(f"[OPEN] [Maker] [{side}] Placing Maker TAKER order")
+        
+        try:
+            # Check if maker_client has place_taker_order method
+            if not hasattr(self.maker_client, 'place_taker_order'):
+                self.logger.error("❌ Maker client does not support taker orders")
+                return False
+                
+            result = await self.maker_client.place_taker_order(
+                contract_id=self.maker_contract_id,
+                quantity=quantity,
+                direction=side
+            )
+            
+            if not result.success:
+                self.logger.error(f"❌ Error placing taker order: {result.error_message}")
+                return False
+                
+            order_id = result.order_id
+            self.current_maker_order_id = order_id
+            
+            # Taker orders fill immediately, wait briefly for confirmation
+            await asyncio.sleep(0.5)
+            
+            # Check order status
+            try:
+                order_info = await self.maker_client.get_order_info(order_id)
+                if order_info and order_info.status == 'FILLED':
+                    self.handle_maker_order_update({
+                        'order_id': order_id,
+                        'side': order_info.side,
+                        'filled_size': order_info.filled_size,
+                        'price': order_info.price,
+                        'status': 'FILLED'
+                    })
+                    return True
+            except Exception as e:
+                self.logger.warning(f"⚠️ Error checking taker order status: {e}")
+                # CRITICAL FIX: For IOC taker orders, assume filled and manually trigger hedge
+                self.logger.info(f"ℹ️  Assuming taker order filled, triggering hedge manually")
+                self.handle_maker_order_update({
+                    'order_id': order_id,
+                    'side': side,
+                    'filled_size': quantity,
+                    'price': 0,  # Price will be fetched from actual fill
+                    'status': 'FILLED'
+                })
+                return True
+                
+            # If we reach here, order status check didn't confirm FILLED
+            # But for IOC taker orders, WebSocket should have already triggered hedge
+            # Return True to allow hedge loop to execute
+            self.logger.info(f"ℹ️  Taker order status not confirmed via API, but WebSocket should have handled it")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error placing taker order: {e}")
+            return False
+
 
     async def place_maker_post_only_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
         """Place a post-only order on Maker exchange."""
@@ -215,12 +396,21 @@ class OrderManager:
         price = order_data.get('price', '0')
         status = order_data.get('status')
         
-        # Only process if this is our current order
-        if order_id and self.current_maker_order_id and str(order_id) != str(self.current_maker_order_id):
+        # For taker orders, WebSocket events may arrive before current_maker_order_id is set
+        # Only ignore if we have a current order ID AND it doesn't match
+        if self.current_maker_order_id and order_id and str(order_id) != str(self.current_maker_order_id):
             self.logger.info(f"ℹ️  Ignoring order update for {order_id} (current order: {self.current_maker_order_id})")
             return
         
+        # If we don't have a current order ID yet, this might be a fast WebSocket event for our taker order
+        # Accept it and set the current order ID
+        if not self.current_maker_order_id and order_id:
+            self.logger.info(f"ℹ️  Accepting WebSocket event for order {order_id} (fast taker fill)")
+            self.current_maker_order_id = order_id
+        
         self.update_maker_order_status(status)
+
+        self.logger.info(f"🔍 DEBUG: status={status}, side={side}, filled_size={filled_size}, price={price}")
 
         if status == 'FILLED':
             if side == 'buy':
@@ -230,8 +420,9 @@ class OrderManager:
 
             self.current_lighter_side = lighter_side
             self.current_lighter_quantity = filled_size
-            self.current_lighter_price = Decimal(price)
+            self.current_lighter_price = Decimal(price) if price else Decimal('0')
             self.waiting_for_lighter_fill = True
+            self.logger.info(f"✅ Set waiting_for_lighter_fill=True, lighter_side={lighter_side}, quantity={filled_size}")
 
     def update_maker_order_status(self, status: str):
         """Update Maker order status."""
@@ -256,6 +447,12 @@ class OrderManager:
             is_ask = True
             price = best_bid[0] * Decimal('0.998')
 
+        # CRITICAL: Round price to tick size to avoid "invalid order base or quote amount" error
+        # Lighter requires prices to be multiples of tick_size
+        if self.tick_size:
+            price = (price / self.tick_size).quantize(Decimal('1'), rounding='ROUND_DOWN') * self.tick_size
+            self.logger.info(f"🔍 Rounded price to tick size: {price} (tick_size={self.tick_size})")
+
         self.lighter_order_filled = False
         self.lighter_order_price = price
         self.lighter_order_side = lighter_side
@@ -263,11 +460,21 @@ class OrderManager:
 
         try:
             client_order_index = int(time.time() * 1000)
+            
+            # Calculate base_amount
+            base_amount = int(quantity * self.base_amount_multiplier)
+            price_int = int(price * self.price_multiplier)
+            
+            # Debug logging
+            self.logger.info(f"🔍 Lighter order params: quantity={quantity}, base_amount={base_amount}, "
+                           f"price={price}, price_int={price_int}, "
+                           f"multipliers: base={self.base_amount_multiplier}, price={self.price_multiplier}")
+            
             tx_info, error = self.lighter_client.sign_create_order(
                 market_index=self.lighter_market_index,
                 client_order_index=client_order_index,
-                base_amount=int(quantity * self.base_amount_multiplier),
-                price=int(price * self.price_multiplier),
+                base_amount=base_amount,
+                price=price_int,
                 is_ask=is_ask,
                 order_type=self.lighter_client.ORDER_TYPE_LIMIT,
                 time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
@@ -289,6 +496,9 @@ class OrderManager:
             return tx_hash
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
+            # CRITICAL: Clear the flag so we don't get stuck
+            self.waiting_for_lighter_fill = False
+            self.order_execution_complete = True
             return None
 
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):

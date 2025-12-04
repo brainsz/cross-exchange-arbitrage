@@ -24,7 +24,7 @@ from .position_tracker import PositionTracker
 class GenericArb:
     """Arbitrage trading bot: makes post-only orders on Maker Exchange, and market orders on Lighter."""
 
-    def __init__(self, 
+    def __init__(self,
                  exchange_client_class: Type[BaseExchangeClient],
                  exchange_name: str,
                  ticker: str, 
@@ -35,7 +35,8 @@ class GenericArb:
                  z_score: float = 1.5, 
                  min_spread: float = 0.0,
                  lighter_fee: float = 0.001,
-                 backpack_fee: float = 0.0):
+                 backpack_fee: float = 0.0,
+                 backpack_taker_fee: float = 0.00024):
         """Initialize the arbitrage trading bot."""
         self.exchange_client_class = exchange_client_class
         self.exchange_name = exchange_name
@@ -52,6 +53,7 @@ class GenericArb:
         self.min_spread = min_spread
         self.lighter_fee = Decimal(str(lighter_fee))
         self.backpack_fee = Decimal(str(backpack_fee))
+        self.backpack_taker_fee = Decimal(str(backpack_taker_fee))
         self.spread_history = deque(maxlen=window_size)
         self.current_mean = None
         self.current_std = None
@@ -64,6 +66,12 @@ class GenericArb:
         self.order_book_manager = OrderBookManager(self.logger)
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
         self.order_manager = OrderManager(self.order_book_manager, self.logger)
+        # Configure fees for smart order selection
+        self.order_manager.set_fees(
+            maker_maker_fee=self.backpack_fee,
+            maker_taker_fee=self.backpack_taker_fee,
+            lighter_fee=self.lighter_fee
+        )
 
         # Initialize clients (will be set later)
         self.maker_client = None
@@ -605,12 +613,21 @@ class GenericArb:
             if self.stop_flag:
                 break
 
-            # Execute trades
-            if (current_pos < self.max_position and long_maker):
-                await self._execute_long_trade()
-            elif (current_pos > -1 * self.max_position and short_maker):
-                await self._execute_short_trade()
-            # Close positions logic
+            # Execute trades with position limit checks
+            # Allow opening positions in the opposite direction even at limits (to close and reverse)
+            if long_maker:
+                # Want to go long (buy Backpack)
+                if current_pos < self.max_position:
+                    await self._execute_long_trade()
+                else:
+                    await asyncio.sleep(0.05)
+            elif short_maker:
+                # Want to go short (sell Backpack)
+                if current_pos > -self.max_position:
+                    await self._execute_short_trade()
+                else:
+                    await asyncio.sleep(0.05)
+            # Close positions logic (mean reversion)
             elif close_long_maker:
                 await self._execute_short_trade()
             elif close_short_maker:
@@ -654,21 +671,27 @@ class GenericArb:
         if self.stop_flag:
             return
 
-        # Update positions
-        try:
-            self.position_tracker.edgex_position = await asyncio.wait_for(
-                self.position_tracker.get_edgex_position(),
-                timeout=3.0
-            )
-            if self.stop_flag:
-                return
-            self.position_tracker.lighter_position = await asyncio.wait_for(
-                self.position_tracker.get_lighter_position(),
-                timeout=3.0
-            )
-        except Exception as e:
-            self.logger.error(f"⚠️ Error getting positions: {e}")
+        # CRITICAL: Don't reset flags if hedge is already pending!
+        if self.order_manager.waiting_for_lighter_fill:
+            self.logger.info(f"⏳ Hedge already pending, skipping new trade")
             return
+
+        # Update positions - Commented out to rely on local tracking
+        # API queries have delays, local tracking via update_edgex_position is more accurate
+        # try:
+        #     self.position_tracker.edgex_position = await asyncio.wait_for(
+        #         self.position_tracker.get_edgex_position(),
+        #         timeout=3.0
+        #     )
+        #     if self.stop_flag:
+        #         return
+        #     self.position_tracker.lighter_position = await asyncio.wait_for(
+        #         self.position_tracker.get_lighter_position(),
+        #         timeout=3.0
+        #     )
+        # except Exception as e:
+        #     self.logger.error(f"⚠️ Error getting positions: {e}")
+        #     return
 
         if self.stop_flag:
             return
@@ -699,81 +722,64 @@ class GenericArb:
 
         try:
             side = 'buy'
-            order_filled = await self.order_manager.place_maker_post_only_order(
+            self.logger.info(f"🔍 DEBUG: About to call place_smart_order, order_execution_complete={self.order_manager.order_execution_complete}")
+            order_filled = await self.order_manager.place_smart_order(
                 side, self.order_quantity, self.stop_flag)
-            if not order_filled or self.stop_flag:
+            self.logger.info(f"🔍 DEBUG: place_smart_order returned {order_filled}, order_execution_complete={self.order_manager.order_execution_complete}")
+            if not order_filled:
+                # Order placement failed, return
+                self.logger.info(f"🔍 DEBUG: Order not filled, returning")
                 return
+            # Don't return here! Continue to hedge loop even if order filled
+            self.logger.info(f"🔍 DEBUG: Order filled, continuing to hedge loop")
         except Exception as e:
             self.logger.error(f"⚠️ Error in trading loop: {e}")
             self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
             sys.exit(1)
-
         start_time = time.time()
+        self.logger.info(f"🔍 DEBUG: Entering hedge loop - order_execution_complete={self.order_manager.order_execution_complete}, waiting_for_lighter_fill={self.order_manager.waiting_for_lighter_fill}")
         while not self.order_manager.order_execution_complete and not self.stop_flag:
+            self.logger.info(f"🔍 DEBUG: In hedge loop iteration - waiting_for_lighter_fill={self.order_manager.waiting_for_lighter_fill}")
             if self.order_manager.waiting_for_lighter_fill:
-                # Retry logic for Lighter order
-                max_retries = 5
-                for i in range(max_retries):
-                    tx_hash = await self.order_manager.place_lighter_market_order(
-                        self.order_manager.current_lighter_side,
-                        self.order_manager.current_lighter_quantity,
-                        self.order_manager.current_lighter_price,
-                        self.stop_flag
-                    )
-                    if tx_hash:
-                        break
-                    self.logger.warning(f"⚠️ Lighter order placement failed, retrying ({i+1}/{max_retries})...")
-                    await asyncio.sleep(1)
-                
-                if not tx_hash:
-                    self.logger.error("❌ CRITICAL: Failed to place Lighter hedge order after retries! Position is unhedged.")
-                    self.logger.warning("⚠️ Attempting EMERGENCY CLOSE of Maker position...")
-                    try:
-                        # We bought on Maker, so we need to Sell to close.
-                        # Use aggressive price (e.g. 5% lower) to ensure fill as Taker
-                        current_price = self.order_manager.current_lighter_price # This is lighter price, not maker
-                        # Fetch current maker bid
-                        bbo = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
-                        exit_price = bbo[0] * Decimal('0.95') # Sell into bid with slippage tolerance
-                        
-                        await self.maker_client.place_close_order(
-                            contract_id=self.maker_contract_id,
-                            quantity=self.order_quantity,
-                            price=exit_price,
-                            side='sell',
-                            post_only=False
-                        )
-                        self.logger.info("✅ Emergency close order placed.")
-                    except Exception as e:
-                        self.logger.error(f"❌ Failed to execute emergency close: {e}")
-                
+                self.logger.info(f"🚀 Executing Lighter hedge order: {self.order_manager.current_lighter_side} {self.order_manager.current_lighter_quantity}")
+                await self.order_manager.place_lighter_market_order(
+                    self.order_manager.current_lighter_side,
+                    self.order_manager.current_lighter_quantity,
+                    self.order_manager.current_lighter_price,
+                    self.stop_flag
+                )
                 break
 
             await asyncio.sleep(0.01)
             if time.time() - start_time > 180:
                 self.logger.error("❌ Timeout waiting for trade completion")
-                break
 
     async def _execute_short_trade(self):
         """Execute a short trade (sell on Maker, buy on Lighter)."""
         if self.stop_flag:
             return
 
-        # Update positions
-        try:
-            self.position_tracker.edgex_position = await asyncio.wait_for(
-                self.position_tracker.get_edgex_position(),
-                timeout=3.0
-            )
-            if self.stop_flag:
-                return
-            self.position_tracker.lighter_position = await asyncio.wait_for(
-                self.position_tracker.get_lighter_position(),
-                timeout=3.0
-            )
-        except Exception as e:
-            self.logger.error(f"⚠️ Error getting positions: {e}")
+        # CRITICAL: Don't reset flags if hedge is already pending!
+        if self.order_manager.waiting_for_lighter_fill:
+            self.logger.info(f"⏳ Hedge already pending, skipping new trade")
             return
+
+        # Update positions - Commented out to rely on local tracking
+        # API queries have delays, local tracking via update_edgex_position is more accurate
+        # try:
+        #     self.position_tracker.edgex_position = await asyncio.wait_for(
+        #         self.position_tracker.get_edgex_position(),
+        #         timeout=3.0
+        #     )
+        #     if self.stop_flag:
+        #         return
+        #     self.position_tracker.lighter_position = await asyncio.wait_for(
+        #         self.position_tracker.get_lighter_position(),
+        #         timeout=3.0
+        #     )
+        # except Exception as e:
+        #     self.logger.error(f"⚠️ Error getting positions: {e}")
+        #     return
 
         if self.stop_flag:
             return
@@ -804,10 +810,12 @@ class GenericArb:
 
         try:
             side = 'sell'
-            order_filled = await self.order_manager.place_maker_post_only_order(
+            order_filled = await self.order_manager.place_smart_order(
                 side, self.order_quantity, self.stop_flag)
-            if not order_filled or self.stop_flag:
+            if not order_filled:
+                # Order placement failed, return
                 return
+            # Don't return here! Continue to hedge loop even if order filled
         except Exception as e:
             self.logger.error(f"⚠️ Error in trading loop: {e}")
             self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -816,42 +824,15 @@ class GenericArb:
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
             if self.order_manager.waiting_for_lighter_fill:
-                # Retry logic for Lighter order
-                max_retries = 5
-                for i in range(max_retries):
-                    tx_hash = await self.order_manager.place_lighter_market_order(
-                        self.order_manager.current_lighter_side,
-                        self.order_manager.current_lighter_quantity,
-                        self.order_manager.current_lighter_price,
-                        self.stop_flag
-                    )
-                    if tx_hash:
-                        break
-                    self.logger.warning(f"⚠️ Lighter order placement failed, retrying ({i+1}/{max_retries})...")
-                    await asyncio.sleep(1)
-                
-                if not tx_hash:
-                    self.logger.error("❌ CRITICAL: Failed to place Lighter hedge order after retries! Position is unhedged.")
-                    self.logger.warning("⚠️ Attempting EMERGENCY CLOSE of Maker position...")
-                    try:
-                        # We sold on Maker, so we need to Buy to close.
-                        # Use aggressive price (e.g. 5% higher) to ensure fill as Taker
-                        bbo = await self.maker_client.fetch_bbo_prices(self.maker_contract_id)
-                        exit_price = bbo[1] * Decimal('1.05') # Buy from ask with slippage tolerance
-                        
-                        await self.maker_client.place_close_order(
-                            contract_id=self.maker_contract_id,
-                            quantity=self.order_quantity,
-                            price=exit_price,
-                            side='buy',
-                            post_only=False
-                        )
-                        self.logger.info("✅ Emergency close order placed.")
-                    except Exception as e:
-                        self.logger.error(f"❌ Failed to execute emergency close: {e}")
-                
+                await self.order_manager.place_lighter_market_order(
+                    self.order_manager.current_lighter_side,
+                    self.order_manager.current_lighter_quantity,
+                    self.order_manager.current_lighter_price,
+                    self.stop_flag
+                )
                 break
 
             await asyncio.sleep(0.01)
             if time.time() - start_time > 180:
                 self.logger.error("❌ Timeout waiting for trade completion")
+                break

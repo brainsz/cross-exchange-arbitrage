@@ -40,6 +40,8 @@ def parse_arguments():
                         help='Lighter taker fee rate (default: 0.001 = 0.1%%)')
     parser.add_argument('--backpack-fee', type=float, default=0.0,
                         help='Backpack maker fee rate (default: 0.0)')
+    parser.add_argument('--backpack-taker-fee', type=float, default=0.00024,
+                        help='Backpack taker fee rate (default: 0.00024 = 0.024%%)')
     return parser.parse_args()
 
 
@@ -73,7 +75,8 @@ async def main():
             z_score=args.z_score,
             min_spread=args.min_spread,
             lighter_fee=args.lighter_fee,
-            backpack_fee=args.backpack_fee
+            backpack_fee=args.backpack_fee,
+            backpack_taker_fee=args.backpack_taker_fee
         )
 
         # Run the bot
