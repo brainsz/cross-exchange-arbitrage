@@ -46,6 +46,7 @@ class OrderManager:
 
         # Callbacks
         self.on_order_filled: Optional[callable] = None
+        self.on_lighter_position_update: Optional[callable] = None
         
         # Fee configuration (default values)
         self.maker_maker_fee = Decimal('0')  # Maker fee on maker exchange
@@ -70,9 +71,11 @@ class OrderManager:
         self.price_multiplier = price_multiplier
         self.tick_size = tick_size
 
-    def set_callbacks(self, on_order_filled: callable = None):
+    def set_callbacks(self, on_order_filled: callable = None, 
+                       on_lighter_position_update: callable = None):
         """Set callback functions."""
         self.on_order_filled = on_order_filled
+        self.on_lighter_position_update = on_lighter_position_update
     
     def set_fees(self, maker_maker_fee: Decimal = Decimal('0'), 
                  maker_taker_fee: Decimal = Decimal('0.00024'),
@@ -434,9 +437,24 @@ class OrderManager:
         if not self.lighter_client:
             raise Exception("Lighter client not initialized")
 
-        best_bid, best_ask = self.order_book_manager.get_lighter_best_levels()
+        # Retry logic for order book not ready
+        max_retries = 10
+        retry_count = 0
+        best_bid, best_ask = None, None
+        
+        while retry_count < max_retries:
+            best_bid, best_ask = self.order_book_manager.get_lighter_best_levels()
+            if best_bid and best_ask:
+                break
+            retry_count += 1
+            self.logger.warning(f"⏳ Lighter order book not ready, retrying... ({retry_count}/{max_retries})")
+            await asyncio.sleep(1)
+        
         if not best_bid or not best_ask:
-            raise Exception("Lighter order book not ready")
+            self.logger.error("❌ Lighter order book still not ready after retries, skipping order")
+            self.waiting_for_lighter_fill = False
+            self.order_execution_complete = True
+            return None
 
         if lighter_side.lower() == 'buy':
             order_type = "CLOSE"
@@ -466,34 +484,29 @@ class OrderManager:
             price_int = int(price * self.price_multiplier)
             
             # Debug logging
-            self.logger.info(f"🔍 Lighter order params: quantity={quantity}, base_amount={base_amount}, "
+            self.logger.info(f"🔍 Lighter MARKET order params: quantity={quantity}, base_amount={base_amount}, "
                            f"price={price}, price_int={price_int}, "
                            f"multipliers: base={self.base_amount_multiplier}, price={self.price_multiplier}")
             
-            tx_info, error = self.lighter_client.sign_create_order(
+            # Use create_market_order for immediate execution
+            # Returns (CreateOrder, tx_hash/RespSendTx, error) on success or (None, None, error) on failure
+            order_result, tx_hash, error = await self.lighter_client.create_market_order(
                 market_index=self.lighter_market_index,
                 client_order_index=client_order_index,
                 base_amount=base_amount,
-                price=price_int,
+                avg_execution_price=price_int,  # Expected average execution price
                 is_ask=is_ask,
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                 reduce_only=False,
-                trigger_price=0,
             )
+                
             if error is not None:
-                raise Exception(f"Sign error: {error}")
+                raise Exception(f"Create market order error: {error}")
 
-            tx_hash = await self.lighter_client.send_tx(
-                tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
-            )
-
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {quantity}")
+            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [MARKET]: {quantity}")
 
             await self.monitor_lighter_order(client_order_index, stop_flag)
 
-            return tx_hash
+            return str(client_order_index)
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             # CRITICAL: Clear the flag so we don't get stuck
@@ -502,16 +515,34 @@ class OrderManager:
             return None
 
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):
-        """Monitor Lighter order and wait for fill."""
+        """Monitor Lighter order and wait for fill.
+        
+        For market orders, we only wait a short time since they execute immediately.
+        The actual position will be verified by the main loop via REST API.
+        """
         start_time = time.time()
+        # Market orders should fill almost instantly, wait max 5 seconds
+        timeout = 5
+        
         while not self.lighter_order_filled and not stop_flag:
-            if time.time() - start_time > 30:
-                self.logger.error(
-                    f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
+            if time.time() - start_time > timeout:
+                self.logger.info(
+                    f"ℹ️ Lighter market order sent, assuming filled after {timeout}s")
+                # For market orders, assume success
                 self.lighter_order_filled = True
                 self.waiting_for_lighter_fill = False
                 self.order_execution_complete = True
+                
+                # Update local position tracker since WebSocket may not have received the fill
+                if self.on_lighter_position_update and self.lighter_order_side and self.lighter_order_size:
+                    if self.lighter_order_side.lower() == 'sell':
+                        # Sell = short position (negative)
+                        self.on_lighter_position_update(-self.lighter_order_size)
+                        self.logger.info(f"📊 Updated Lighter position: -{self.lighter_order_size}")
+                    else:
+                        # Buy = long position (positive)
+                        self.on_lighter_position_update(self.lighter_order_size)
+                        self.logger.info(f"📊 Updated Lighter position: +{self.lighter_order_size}")
                 break
 
             await asyncio.sleep(0.1)

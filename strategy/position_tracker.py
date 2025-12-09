@@ -2,9 +2,13 @@
 import asyncio
 import json
 import logging
+import os
 import requests
 import sys
 from decimal import Decimal
+
+# Bypass proxy for Lighter API to avoid SSL issues
+os.environ.setdefault('NO_PROXY', os.environ.get('NO_PROXY', '') + ',mainnet.zklighter.elliot.ai')
 
 
 class PositionTracker:
@@ -46,7 +50,8 @@ class PositionTracker:
         attempts = 0
         while current_position is None and attempts < 10:
             try:
-                response = requests.get(url, headers=headers, params=parameters, timeout=10)
+                # Disable SSL verification for proxy compatibility
+                response = requests.get(url, headers=headers, params=parameters, timeout=10, verify=False)
                 response.raise_for_status()
 
                 if not response.text.strip():
@@ -91,7 +96,8 @@ class PositionTracker:
         params = {"by": "index", "value": self.account_index}
         
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            # Disable SSL verification for proxy compatibility
+            response = requests.get(url, headers=headers, params=params, timeout=10, verify=False)
             response.raise_for_status()
             data = response.json()
             

@@ -145,7 +145,8 @@ class GenericArb:
             on_edgex_order_update=self._handle_maker_order_update
         )
         self.order_manager.set_callbacks(
-            on_order_filled=self._handle_lighter_order_filled
+            on_order_filled=self._handle_lighter_order_filled,
+            on_lighter_position_update=self._update_lighter_position_fallback
         )
 
     def _update_spread_stats(self, current_spread: float) -> Tuple[float, float]:
@@ -236,6 +237,15 @@ class GenericArb:
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
+
+    def _update_lighter_position_fallback(self, delta: Decimal):
+        """Update Lighter position when WebSocket doesn't receive fill confirmation.
+        
+        This is called by order_manager when a market order times out but is assumed filled.
+        """
+        if self.position_tracker:
+            self.position_tracker.update_lighter_position(delta)
+            self.logger.info(f"📊 Fallback position update: Lighter {delta:+.4f}")
 
     def _handle_maker_order_update(self, order: dict):
         """Handle Maker order update."""
@@ -351,9 +361,8 @@ class GenericArb:
 
             self.lighter_client = SignerClient(
                 url=self.lighter_base_url,
-                private_key=api_key_private_key,
                 account_index=self.account_index,
-                api_key_index=self.api_key_index,
+                api_private_keys={self.api_key_index: api_key_private_key},
             )
 
             err = self.lighter_client.check_client()
@@ -551,6 +560,7 @@ class GenericArb:
                         await asyncio.sleep(0.5 * retry_count)
             
             if maker_best_bid == 0 and maker_best_ask == 0:
+                self.logger.warning(f"Maker BBO returned 0, waiting...")
                 await asyncio.sleep(1)
                 continue
 
@@ -558,6 +568,7 @@ class GenericArb:
 
             # Calculate mid prices and spread
             if not (lighter_bid and lighter_ask and maker_best_bid and maker_best_ask):
+                self.logger.warning(f"Missing BBO data: lighter=({lighter_bid}, {lighter_ask}), maker=({maker_best_bid}, {maker_best_ask})")
                 await asyncio.sleep(0.1)
                 continue
 
@@ -572,6 +583,12 @@ class GenericArb:
                 self.logger.info(f"Collecting data... {len(self.spread_history)}/{self.window_size}")
                 await asyncio.sleep(1)
                 continue
+            
+            # Log when we start monitoring after data collection
+            if len(self.spread_history) == self.window_size and not hasattr(self, '_logged_start'):
+                self.logger.info(f"✅ Data collection complete! Starting market monitoring...")
+                self.logger.info(f"   Mean spread: {self.current_mean:.4f}, Std: {self.current_std:.4f}")
+                self._logged_start = True
 
             # Determine thresholds
             upper_threshold = self.current_mean + (self.z_score * self.current_std)

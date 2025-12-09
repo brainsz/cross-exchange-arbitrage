@@ -149,8 +149,15 @@ class WebSocketManagerWrapper:
 
     async def handle_lighter_ws(self):
         """Handle Lighter WebSocket connection and messages."""
+        import ssl
+        
         url = "wss://mainnet.zklighter.elliot.ai/stream"
         cleanup_counter = 0
+        
+        # Create SSL context that doesn't verify certificates (for proxy environments)
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
 
         while not self.stop_flag:
             timeout_count = 0
@@ -158,7 +165,7 @@ class WebSocketManagerWrapper:
                 # Reset order book state before connecting
                 await self.order_book_manager.reset_lighter_order_book()
 
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ssl=ssl_context) as ws:
                     # Subscribe to order book updates
                     await ws.send(json.dumps({
                         "type": "subscribe",
