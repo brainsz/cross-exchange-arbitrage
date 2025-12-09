@@ -12,3 +12,13 @@ EDGEX_WS_URL=wss://quote.edgex.exchange
 API_KEY_PRIVATE_KEY=your_api_key_private_key_here
 LIGHTER_ACCOUNT_INDEX=your_account_index
 LIGHTER_API_KEY_INDEX=your_api_key_index
+
+# Backpack Exchange Credentials
+BACKPACK_API_KEY=your_backpack_api_key_here
+BACKPACK_API_SECRET=your_backpack_api_secret_here
+
+# Extended Configuration
+EXTENDED_API_KEY=your_extended_api_key
+EXTENDED_STARK_KEY_PUBLIC=your_stark_public_key
+EXTENDED_STARK_KEY_PRIVATE=your_stark_private_key
+EXTENDED_VAULT=extended_vault_id

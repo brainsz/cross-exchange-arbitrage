@@ -202,6 +202,9 @@ class BackpackClient(BaseExchangeClient):
         # Track processed filled orders to prevent duplicates
         self._processed_fills = set()
         
+        # Cache for tick sizes
+        self.tick_sizes = {}
+        
     def _validate_config(self) -> None:
         """Validate Backpack configuration."""
         required_env_vars = ['BACKPACK_API_KEY', 'BACKPACK_API_SECRET']
@@ -234,6 +237,7 @@ class BackpackClient(BaseExchangeClient):
                     
                     self.config.contract_id = self.config.ticker
                     self.config.tick_size = tick_size
+                    self.tick_sizes[self.config.ticker] = tick_size
                     return self.config.ticker, tick_size
             raise ValueError(f"Market {self.config.ticker} not found on Backpack")
         except Exception as e:
@@ -371,9 +375,41 @@ class BackpackClient(BaseExchangeClient):
             self.logger.log(f"Error fetching BBO: {e}", "ERROR")
             return Decimal('0'), Decimal('0')
 
+    async def get_tick_size(self, contract_id: str) -> Decimal:
+        """Get tick size for a contract, fetching if not cached."""
+        if contract_id in self.tick_sizes:
+            return self.tick_sizes[contract_id]
+            
+        # Fetch from API
+        try:
+            markets = await asyncio.wait_for(
+                asyncio.to_thread(self.public.get_markets),
+                timeout=10
+            )
+            for m in markets:
+                if m['symbol'] == contract_id:
+                    tick_size = Decimal(m['filters']['price']['tickSize'])
+                    self.tick_sizes[contract_id] = tick_size
+                    return tick_size
+            
+            # Fallback to config if matches (legacy)
+            if contract_id == self.config.contract_id:
+                return self.config.tick_size
+                
+            self.logger.log(f"Tick size not found for {contract_id}, using default 0.01", "WARNING")
+            return Decimal("0.01")
+        except Exception as e:
+            self.logger.log(f"Error fetching tick size: {e}", "ERROR")
+            return Decimal("0.01")
+
+    def round_to_tick_dynamic(self, price: Decimal, tick_size: Decimal) -> Decimal:
+        return price.quantize(tick_size, rounding=ROUND_HALF_UP)
+
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order (post-only limit order)."""
         try:
+
+            tick_size = await self.get_tick_size(contract_id)
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
             
             if best_bid <= 0 or best_ask <= 0:
@@ -385,14 +421,14 @@ class BackpackClient(BaseExchangeClient):
             
             if direction == 'buy':
                 # Buy order: slightly below mid-price
-                order_price = mid_price - self.config.tick_size
+                order_price = mid_price - tick_size
                 side = 'Bid'
             else:
                 # Sell order: slightly above mid-price
-                order_price = mid_price + self.config.tick_size
+                order_price = mid_price + tick_size
                 side = 'Ask'
 
-            order_price = self.round_to_tick(order_price)
+            order_price = self.round_to_tick_dynamic(order_price, tick_size)
 
             # Place order using bpx-py
             result = await asyncio.wait_for(
@@ -450,7 +486,8 @@ class BackpackClient(BaseExchangeClient):
                 order_price = best_bid  # Sell at bid (taker)
                 side = 'Ask'
 
-            order_price = self.round_to_tick(order_price)
+            tick_size = await self.get_tick_size(contract_id)
+            order_price = self.round_to_tick_dynamic(order_price, tick_size)
 
             # Place order without post_only (allows taker)
             result = await asyncio.wait_for(
@@ -647,7 +684,10 @@ class BackpackClient(BaseExchangeClient):
             else:
                 return OrderResult(success=False, error_message=f'Invalid side: {side}')
 
-            order_price = self.round_to_tick(price)
+
+
+            tick_size = await self.get_tick_size(contract_id)
+            order_price = self.round_to_tick_dynamic(price, tick_size)
 
             # Place order using bpx-py
             result = await asyncio.wait_for(

@@ -11,6 +11,7 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 from strategy.generic_arb import GenericArb
 from exchanges.edgex import EdgeXClient
 from exchanges.backpack import BackpackClient
+from exchanges.extended import ExtendedClient
 
 
 def parse_arguments():
@@ -36,12 +37,12 @@ def parse_arguments():
                         help='Z-score for dynamic thresholds (default: 1.5)')
     parser.add_argument('--min-spread', type=float, default=0.0,
                         help='Minimum spread required to trade (default: 0.0)')
-    parser.add_argument('--lighter-fee', type=float, default=0.001,
-                        help='Lighter taker fee rate (default: 0.001 = 0.1%%)')
-    parser.add_argument('--backpack-fee', type=float, default=0.0,
-                        help='Backpack maker fee rate (default: 0.0)')
-    parser.add_argument('--backpack-taker-fee', type=float, default=0.00024,
-                        help='Backpack taker fee rate (default: 0.00024 = 0.024%%)')
+    parser.add_argument('--lighter-fee', type=float, default=0.0,
+                        help='Lighter taker fee rate (default: 0.0)')
+    parser.add_argument('--maker-fee', type=float, default=0.0,
+                        help='Maker exchange maker fee rate (default: 0.0)')
+    parser.add_argument('--maker-taker-fee', type=float, default=0.00025,
+                        help='Maker exchange taker fee rate (default: 0.00025 = 0.025%%)')
     return parser.parse_args()
 
 
@@ -51,6 +52,8 @@ def get_exchange_client_class(exchange_name):
         return EdgeXClient
     elif exchange_name == 'backpack':
         return BackpackClient
+    elif exchange_name == 'extended':
+        return ExtendedClient
     else:
         raise ValueError(f"Unsupported exchange: {exchange_name}")
 
@@ -75,8 +78,8 @@ async def main():
             z_score=args.z_score,
             min_spread=args.min_spread,
             lighter_fee=args.lighter_fee,
-            backpack_fee=args.backpack_fee,
-            backpack_taker_fee=args.backpack_taker_fee
+            backpack_fee=args.maker_fee,
+            backpack_taker_fee=args.maker_taker_fee
         )
 
         # Run the bot
